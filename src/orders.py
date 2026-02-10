@@ -159,6 +159,17 @@ def run_order_loop(client: IBKRClient, df: pd.DataFrame) -> list[dict]:
         bid = row.get("bid")
         ask = row.get("ask")
 
+        # Determine FX rate early so we can include it in skip checks.
+        ccy = row.get("currency")
+        fx_raw = row.get("fx_rate")
+        is_usd = pd.isna(ccy) or str(ccy).upper() == "USD"
+        if is_usd:
+            fx = 1.0
+        elif pd.notna(fx_raw) and float(fx_raw) > 0:
+            fx = float(fx_raw)
+        else:
+            fx = None  # non-USD with no usable rate
+
         # Skip rows that cannot be ordered.
         skip_reasons: list[str] = []
         if pd.isna(conid):
@@ -167,6 +178,8 @@ def run_order_loop(client: IBKRClient, df: pd.DataFrame) -> list[dict]:
             skip_reasons.append("no limit price")
         if pd.isna(dollar_alloc):
             skip_reasons.append("no dollar allocation")
+        if fx is None:
+            skip_reasons.append(f"no exchange rate for {ccy}")
 
         if skip_reasons:
             print(
@@ -197,22 +210,34 @@ def run_order_loop(client: IBKRClient, df: pd.DataFrame) -> list[dict]:
             quantity_initial = abs(net_qty)
         else:
             # Buy-all mode – compute from dollar allocation.
+            # Dollar Allocation is in USD; limit_price is in local currency.
             side = "SELL" if dollar_alloc < 0 else "BUY"
             abs_alloc = abs(dollar_alloc)
-            quantity_initial = math.floor(abs_alloc / limit_price) if limit_price > 0 else 0
+            local_alloc = abs_alloc * fx
+            quantity_initial = math.floor(local_alloc / limit_price) if limit_price > 0 else 0
 
         quantity = quantity_initial
 
+        # Currency info for display.
+        ccy = row.get("currency")
+        ccy_label = str(ccy) if pd.notna(ccy) else "USD"
+        is_foreign = ccy_label != "USD"
+
         # --- Prompt loop ---
         while True:
-            planned_alloc = round(limit_price * quantity, 2)
+            local_amount = round(limit_price * quantity, 2)
             details = (
                 f"\n[{idx + 1}/{total}] {name} ({ticker})\n"
                 f"  Side              : {side}\n"
-                f"  Limit Price       : {_format_currency(limit_price)}\n"
+                f"  Currency          : {ccy_label}\n"
+                f"  Limit Price       : {limit_price:,.2f} {ccy_label}\n"
                 f"  Quantity          : {quantity}\n"
-                f"  Dollar Amount     : {_format_currency(planned_alloc)}\n"
+                f"  Amount            : {local_amount:,.2f} {ccy_label}\n"
             )
+            if is_foreign:
+                usd_amount = round(local_amount / fx, 2) if fx > 0 else None
+                if usd_amount is not None:
+                    details += f"  Amount (USD)      : {_format_currency(usd_amount)}\n"
             # Show reconciliation context if available.
             if pd.notna(net_qty_raw):
                 existing = row.get("existing_qty", 0)

@@ -120,6 +120,51 @@ class IBKRClient:
         resp.raise_for_status()
         return resp.json()
 
+    def get_secdef_batch(self, conids: list[int]) -> list[dict]:
+        """Fetch security definitions for a batch of conids.
+
+        Uses ``GET /trsrv/secdef?conids=...`` which returns details
+        including the trading currency for each contract.
+
+        Parameters
+        ----------
+        conids : list[int]
+            Contract IDs to look up.
+
+        Returns
+        -------
+        list[dict]
+            One dict per conid with fields like ``conid``, ``currency``,
+            ``name``, ``assetClass``, etc.
+        """
+        resp = self.session.get(
+            f"{self.base_url}/trsrv/secdef",
+            params={"conids": ",".join(str(c) for c in conids)},
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        # Response may be {"secdef": [...]} or a bare list.
+        if isinstance(data, dict):
+            return data.get("secdef", [])
+        if isinstance(data, list):
+            return data
+        return []
+
+    def get_exchange_rate(self, source: str, target: str) -> float | None:
+        """Fetch the exchange rate from *source* to *target* currency.
+
+        Uses ``GET /iserver/exchangerate?source=...&target=...``.
+
+        Returns the rate as a float, or None on failure.
+        """
+        resp = self.session.get(
+            f"{self.base_url}/iserver/exchangerate",
+            params={"source": source, "target": target},
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        return data.get("rate")
+
     # ------------------------------------------------------------------
     # Market data
     # ------------------------------------------------------------------

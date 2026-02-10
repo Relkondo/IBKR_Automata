@@ -164,9 +164,29 @@ def reconcile(client: IBKRClient,
         limit_price = float(limit_price)
         dollar_alloc = float(dollar_alloc)
 
+        # FX rate: local currency units per 1 USD (1.0 for USD positions).
+        # Non-USD positions without a valid rate are skipped.
+        ccy = row.get("currency")
+        fx_raw = row.get("fx_rate")
+        is_usd = pd.isna(ccy) or str(ccy).upper() == "USD"
+        if is_usd:
+            fx = 1.0
+        elif pd.notna(fx_raw) and float(fx_raw) > 0:
+            fx = float(fx_raw)
+        else:
+            # Cannot reconcile without a valid exchange rate.
+            existing_qtys.append(None)
+            pending_qtys.append(None)
+            target_qtys.append(None)
+            net_qtys.append(None)
+            cancelled_counts.append(0)
+            continue
+
         # --- Target quantity (signed: positive=BUY, negative=SELL) ---
+        # Dollar Allocation is in USD; limit_price is in local currency.
         if limit_price > 0:
-            target = math.floor(abs(dollar_alloc) / limit_price)
+            local_alloc = abs(dollar_alloc) * fx
+            target = math.floor(local_alloc / limit_price)
             target = target if dollar_alloc >= 0 else -target
         else:
             target = 0

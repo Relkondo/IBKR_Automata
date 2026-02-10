@@ -19,7 +19,7 @@ import time
 import pandas as pd
 
 from src.api_client import IBKRClient
-from src.config import OUTPUT_DIR
+from src.config import OPENAI_API_KEY_FILE, OUTPUT_DIR
 
 # ------------------------------------------------------------------
 # IBKR field codes
@@ -230,6 +230,184 @@ def _calc_limit_price(row) -> float | None:
 
 
 # ------------------------------------------------------------------
+# Currency resolution
+# ------------------------------------------------------------------
+
+# Batch size for /trsrv/secdef (URL length can be an issue with many conids).
+_SECDEF_BATCH = 50
+
+
+def _ask_llm_for_fx_rate(currency: str) -> float | None:
+    """Ask an LLM for the approximate USD -> *currency* exchange rate."""
+    try:
+        with open(OPENAI_API_KEY_FILE) as f:
+            api_key = f.read().strip()
+    except FileNotFoundError:
+        return None
+    if not api_key:
+        return None
+
+    try:
+        from openai import OpenAI
+    except ImportError:
+        print("  [!] openai package not installed – skipping LLM fallback.")
+        return None
+
+    prompt = (
+        f"What is the current approximate exchange rate from 1 USD to {currency}? "
+        f"Reply with ONLY the numeric rate (e.g. 31.5), nothing else."
+    )
+
+    try:
+        llm = OpenAI(api_key=api_key)
+        response = llm.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0,
+            max_tokens=20,
+        )
+        text = response.choices[0].message.content.strip()
+        rate = float(text)
+        if rate > 0:
+            return rate
+    except Exception as exc:
+        print(f"  [!] LLM request failed: {exc}")
+
+    return None
+
+
+def _resolve_fx_rate(client: IBKRClient, ccy: str) -> float | None:
+    """Try every available method to obtain the USD -> *ccy* rate.
+
+    Fallback chain:
+      1. IBKR ``/iserver/exchangerate`` (forward).
+      2. IBKR ``/iserver/exchangerate`` (reverse, then invert).
+      3. Ask the OpenAI LLM for an approximate rate; confirm with user.
+      4. Ask the user to type the rate manually.
+
+    Returns the rate (local per 1 USD) or None if the user declines.
+    """
+    # --- Attempt 1: IBKR forward ---
+    try:
+        rate = client.get_exchange_rate(source="USD", target=ccy)
+        if rate is not None and float(rate) > 0:
+            print(f"  USD -> {ccy} = {rate}")
+            return float(rate)
+    except Exception as exc:
+        print(f"  [!] Exchange rate request failed for {ccy}: {exc}")
+
+    # --- Attempt 2: IBKR reverse ---
+    try:
+        print(f"  [!] USD -> {ccy} unavailable, trying reverse ...")
+        rev = client.get_exchange_rate(source=ccy, target="USD")
+        if rev is not None and float(rev) > 0:
+            inverted = round(1.0 / float(rev), 6)
+            print(f"  {ccy} -> USD = {rev}  =>  USD -> {ccy} = {inverted}")
+            return inverted
+    except Exception as exc:
+        print(f"  [!] Reverse exchange rate request failed for {ccy}: {exc}")
+
+    # --- Attempt 3: LLM fallback ---
+    print(f"  [~] Asking LLM for USD -> {ccy} rate ...")
+    llm_rate = _ask_llm_for_fx_rate(ccy)
+    if llm_rate is not None:
+        user_input = input(
+            f"  LLM suggests USD -> {ccy} = {llm_rate}. "
+            f"Accept? [Y] Yes  [N] Enter manually  > "
+        ).strip().upper()
+        if user_input == "Y" or user_input == "":
+            print(f"  USD -> {ccy} = {llm_rate} (LLM, confirmed)")
+            return llm_rate
+    else:
+        print(f"  [!] LLM could not provide a rate for {ccy}.")
+
+    # --- Attempt 4: manual input ---
+    user_input = input(
+        f"  Enter USD -> {ccy} rate (or press Enter to skip {ccy}): "
+    ).strip()
+    if user_input:
+        try:
+            manual_rate = float(user_input)
+            if manual_rate > 0:
+                print(f"  USD -> {ccy} = {manual_rate} (manual)")
+                return manual_rate
+            else:
+                print(f"  [!] Invalid rate. Skipping {ccy}.")
+        except ValueError:
+            print(f"  [!] Not a number. Skipping {ccy}.")
+
+    print(f"  [!] No exchange rate for {ccy}. "
+          f"Orders in {ccy} will be skipped.")
+    return None
+
+
+def resolve_currencies(client: IBKRClient, df: pd.DataFrame) -> pd.DataFrame:
+    """Add ``currency`` and ``fx_rate`` columns to the portfolio table.
+
+    1. Fetch the trading currency for every resolved conid via
+       ``/trsrv/secdef``.
+    2. For each non-USD currency, fetch the USD -> local exchange rate
+       via ``/iserver/exchangerate``.
+    3. Store the results so that downstream quantity calculations can
+       convert the USD *Dollar Allocation* to local-currency terms.
+
+    ``fx_rate`` is the number of local-currency units per 1 USD.
+    For USD positions, ``fx_rate`` = 1.0.
+    """
+    valid = df[df["conid"].notna()].copy()
+    all_conids = valid["conid"].astype(int).tolist()
+
+    if not all_conids:
+        df["currency"] = None
+        df["fx_rate"] = None
+        return df
+
+    print(f"Resolving currencies for {len(all_conids)} contracts ...")
+
+    # --- Step 1: fetch currency per conid ---
+    cid_to_currency: dict[int, str] = {}
+    for i in range(0, len(all_conids), _SECDEF_BATCH):
+        batch = all_conids[i : i + _SECDEF_BATCH]
+        try:
+            data = client.get_secdef_batch(batch)
+            for entry in data:
+                cid = entry.get("conid")
+                ccy = entry.get("currency")
+                if cid is not None and ccy:
+                    cid_to_currency[int(cid)] = ccy.upper()
+        except Exception as exc:
+            print(f"  [!] /trsrv/secdef batch failed: {exc}")
+
+    # --- Step 2: fetch exchange rates for unique non-USD currencies ---
+    unique_currencies = set(cid_to_currency.values()) - {"USD"}
+    fx_rates: dict[str, float] = {"USD": 1.0}
+    for ccy in sorted(unique_currencies):
+        resolved = _resolve_fx_rate(client, ccy)
+        if resolved is not None:
+            fx_rates[ccy] = resolved
+
+    # --- Step 3: map back to the DataFrame ---
+    currencies: list[str | None] = []
+    rates: list[float | None] = []
+    for _, row in df.iterrows():
+        cid = row.get("conid")
+        if pd.notna(cid) and int(cid) in cid_to_currency:
+            ccy = cid_to_currency[int(cid)]
+            currencies.append(ccy)
+            rates.append(fx_rates.get(ccy))
+        else:
+            currencies.append(None)
+            rates.append(None)
+
+    df["currency"] = currencies
+    df["fx_rate"] = rates
+
+    n_foreign = sum(1 for c in currencies if c is not None and c != "USD")
+    print(f"  {n_foreign} foreign-currency positions identified.\n")
+    return df
+
+
+# ------------------------------------------------------------------
 # Public API
 # ------------------------------------------------------------------
 
@@ -288,20 +466,45 @@ def fetch_market_data(client: IBKRClient, df: pd.DataFrame) -> pd.DataFrame:
 
     df["limit_price"] = df.apply(_calc_limit_price, axis=1)
 
-    # Qty = floor(|Dollar Allocation| / limit_price), signed.
-    # Actual Dollar Allocation = limit_price * |Qty|.
+    # Qty = floor(|Dollar Allocation converted to local currency| / limit_price), signed.
+    # Dollar Allocation is in USD; limit_price is in the local trading
+    # currency.  We use fx_rate (local per 1 USD) to convert before dividing.
+    # Actual Dollar Allocation (USD) = limit_price * |Qty| / fx_rate.
+    def _get_fx(r) -> float | None:
+        """Return the fx_rate for the row.
+
+        Returns 1.0 for USD positions, the stored rate for others,
+        or None if the rate is missing/zero for a non-USD currency.
+        """
+        ccy = r.get("currency")
+        fx = r.get("fx_rate")
+        # USD positions don't need conversion.
+        if pd.isna(ccy) or str(ccy).upper() == "USD":
+            return 1.0
+        if pd.notna(fx) and float(fx) > 0:
+            return float(fx)
+        return None  # non-USD with no usable rate
+
     def _planned_qty(r):
         lp = r.get("limit_price")
         da = r.get("Dollar Allocation")
         if pd.isna(lp) or pd.isna(da) or float(lp) <= 0:
             return None
-        shares = math.floor(abs(float(da)) / float(lp))
+        fx = _get_fx(r)
+        if fx is None:
+            return None
+        local_alloc = abs(float(da)) * fx
+        shares = math.floor(local_alloc / float(lp))
         return shares if float(da) >= 0 else -shares
 
     df["Qty"] = df.apply(_planned_qty, axis=1)
     df["Actual Dollar Allocation"] = df.apply(
-        lambda r: round(float(r["limit_price"]) * abs(float(r["Qty"])), 2)
+        lambda r: round(
+            float(r["limit_price"]) * abs(float(r["Qty"])) / (_get_fx(r) or 1.0),
+            2,
+        )
         if pd.notna(r.get("limit_price")) and pd.notna(r.get("Qty"))
+        and _get_fx(r) is not None
         else None,
         axis=1,
     )

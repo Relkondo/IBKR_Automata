@@ -32,7 +32,7 @@ from src.config import OUTPUT_DIR
 from src.gateway import launch_gateway, wait_for_auth, SessionKeepalive
 from src.portfolio import load_portfolio
 from src.contracts import resolve_conids
-from src.market_data import fetch_market_data, save_project_portfolio
+from src.market_data import fetch_market_data, resolve_currencies, save_project_portfolio
 from src.orders import run_order_loop, print_order_summary
 from src.reconcile import reconcile
 
@@ -102,6 +102,11 @@ def main() -> None:
             df = _load_project_portfolio()
 
             # ----------------------------------------------------------
+            # 3b. Resolve currencies & exchange rates
+            # ----------------------------------------------------------
+            df = resolve_currencies(client, df)
+
+            # ----------------------------------------------------------
             # 4. Fetch market data & compute limit prices
             # ----------------------------------------------------------
             df = fetch_market_data(client, df)
@@ -121,6 +126,11 @@ def main() -> None:
             # ----------------------------------------------------------
             print("Resolving contract IDs ...\n")
             df = resolve_conids(client, df)
+
+            # ----------------------------------------------------------
+            # 3b. Resolve currencies & exchange rates
+            # ----------------------------------------------------------
+            df = resolve_currencies(client, df)
 
             # ----------------------------------------------------------
             # 4. Fetch market data & compute limit prices
