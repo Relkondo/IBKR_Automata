@@ -6,6 +6,7 @@ printed at the end.
 """
 
 import math
+import re
 
 import pandas as pd
 
@@ -13,6 +14,11 @@ from src.api_client import IBKRClient
 
 # Maximum number of reply-confirmation round-trips before giving up.
 MAX_REPLY_ROUNDS = 5
+
+# Regex to detect IBKR's minimum-tick-size rejection and extract the tick size.
+_MIN_TICK_RE = re.compile(
+    r"minimum price variation of ([\d.]+)"
+)
 
 
 # ------------------------------------------------------------------
@@ -81,6 +87,42 @@ def _submit_and_confirm(client: IBKRClient, account_id: str,
 
 def _format_currency(value: float) -> str:
     return f"${value:,.2f}"
+
+
+def _snap_to_tick(price: float, tick_size: float, side: str) -> float:
+    """Round *price* to the nearest multiple of *tick_size*.
+
+    When the price falls exactly at the midpoint between two ticks,
+    choose the more aggressive side:
+      - BUY  -> round **down** (lower price is more aggressive for buyer)
+      - SELL -> round **up** (higher price is more aggressive for seller)
+    """
+    lower = round(math.floor(price / tick_size) * tick_size, 10)
+    upper = round(lower + tick_size, 10)
+
+    dist_lower = abs(price - lower)
+    dist_upper = abs(price - upper)
+
+    if abs(dist_lower - dist_upper) < 1e-12:
+        # Exactly at the midpoint — pick the aggressive side.
+        return round(lower if side == "BUY" else upper, 2)
+    elif dist_lower < dist_upper:
+        return round(lower, 2)
+    else:
+        return round(upper, 2)
+
+
+def _extract_error_text(response) -> str:
+    """Pull all error / message text out of an IBKR order response."""
+    parts: list[str] = []
+    items = response if isinstance(response, list) else [response]
+    for item in items:
+        if isinstance(item, dict):
+            if "error" in item:
+                parts.append(str(item["error"]))
+            for msg in item.get("message", []):
+                parts.append(str(msg))
+    return " ".join(parts)
 
 
 # ------------------------------------------------------------------
@@ -211,6 +253,19 @@ def run_order_loop(client: IBKRClient, df: pd.DataFrame) -> list[dict]:
                 }
                 try:
                     result = _submit_and_confirm(client, account_id, order_ticket)
+
+                    # Check the response body for a tick-size rejection.
+                    resp_text = _extract_error_text(result)
+                    tick_match = _MIN_TICK_RE.search(resp_text)
+                    if tick_match:
+                        tick_size = float(tick_match.group(1))
+                        adjusted = _snap_to_tick(limit_price, tick_size, side)
+                        print(f"    Price {_format_currency(limit_price)} doesn't "
+                              f"conform to tick size {tick_size}. "
+                              f"Retrying at {_format_currency(adjusted)} ...")
+                        limit_price = adjusted
+                        continue  # loops back, re-displays & re-submits
+
                     # Extract order id from response.
                     order_id = None
                     if isinstance(result, list):
@@ -245,6 +300,24 @@ def run_order_loop(client: IBKRClient, df: pd.DataFrame) -> list[dict]:
                             "order_id": str(result),
                         })
                 except Exception as exc:
+                    # Check for tick-size error in exception text
+                    # (may come from HTTP 400 or confirmation replies).
+                    error_text = str(exc)
+                    if hasattr(exc, "response") and exc.response is not None:
+                        try:
+                            error_text = exc.response.text
+                        except Exception:
+                            pass
+                    tick_match = _MIN_TICK_RE.search(error_text)
+                    if tick_match:
+                        tick_size = float(tick_match.group(1))
+                        adjusted = _snap_to_tick(limit_price, tick_size, side)
+                        print(f"    Price {_format_currency(limit_price)} doesn't "
+                              f"conform to tick size {tick_size}. "
+                              f"Retrying at {_format_currency(adjusted)} ...")
+                        limit_price = adjusted
+                        continue  # loops back, re-displays & re-submits
+
                     print(f"    [!] Order failed: {exc}")
                     if confirm_all:
                         print("    Skipping (auto-confirm mode).")
@@ -285,7 +358,7 @@ def run_order_loop(client: IBKRClient, df: pd.DataFrame) -> list[dict]:
 
             elif choice == "S":
                 print("    Skipped.")
-                breakFS
+                break
 
             elif choice == "Q":
                 print("    Quitting order loop.")
