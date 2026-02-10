@@ -1,0 +1,400 @@
+"""ConID resolution for stocks and options.
+
+For stocks we call POST /iserver/secdef/search.
+For options we first resolve the underlying conid, then call
+GET /iserver/secdef/info to find the specific option contract.
+
+Fallback chain when a ticker is not found:
+  1. Retry the IBKR search using the company *name* instead of the ticker.
+  2. Ask an LLM (OpenAI) to infer the IBKR ticker from the company name,
+     then retry the search with the suggested ticker.
+"""
+
+import os
+import time
+from datetime import datetime
+
+import pandas as pd
+
+from src.api_client import IBKRClient
+from src.config import OPENAI_API_KEY_FILE
+from src.portfolio import _OPT_TICKER_RE, MONTH_MAP
+
+
+# ------------------------------------------------------------------
+# Helpers – MIC sanitisation
+# ------------------------------------------------------------------
+
+def _safe_mic(mic) -> str | None:
+    """Return *mic* as an uppercase string, or None if it's missing/NaN."""
+    if mic is None:
+        return None
+    if isinstance(mic, float):
+        # pandas NaN is a float
+        return None
+    s = str(mic).strip()
+    return s if s else None
+
+
+# ------------------------------------------------------------------
+# Helpers – exchange matching
+# ------------------------------------------------------------------
+
+def _match_exchange(results: list, mic: str | None) -> dict | None:
+    """Pick the search result whose exchange best matches *mic*.
+
+    Only dict entries are considered; non-dict items are skipped.
+    """
+    if not results:
+        return None
+
+    dict_results = [e for e in results if isinstance(e, dict)]
+    if not dict_results:
+        return None
+
+    if mic:
+        mic_upper = mic.upper()
+        for entry in dict_results:
+            sections = entry.get("sections", [])
+            for section in sections:
+                if isinstance(section, dict) and section.get("exchange", "").upper() == mic_upper:
+                    return entry
+            if entry.get("exchange", "").upper() == mic_upper:
+                return entry
+
+    return dict_results[0]
+
+
+# ------------------------------------------------------------------
+# LLM fallback
+# ------------------------------------------------------------------
+
+def _ask_llm_for_ticker(name: str, mic: str | None) -> str | None:
+    """Ask an LLM to infer the IBKR ticker for a company name.
+
+    Uses the OpenAI API if the ``OPENAI_API_KEY`` environment variable is
+    set.  Returns the suggested ticker string, or None on failure.
+    """
+    try:
+        with open(OPENAI_API_KEY_FILE) as f:
+            api_key = f.read().strip()
+    except FileNotFoundError:
+        print(f"  [!] OpenAI key file not found at {OPENAI_API_KEY_FILE} – skipping LLM fallback.")
+        return None
+    if not api_key:
+        print(f"  [!] OpenAI key file is empty – skipping LLM fallback.")
+        return None
+
+    try:
+        from openai import OpenAI
+    except ImportError:
+        print("  [!] openai package not installed – skipping LLM fallback.")
+        return None
+
+    exchange_hint = f" (traded on exchange {mic})" if mic else ""
+    prompt = (
+        f"What is the Interactive Brokers (IBKR) ticker symbol for "
+        f"the company \"{name}\"{exchange_hint}? "
+        f"Reply with ONLY the ticker symbol, nothing else."
+    )
+
+    try:
+        client = OpenAI(api_key=api_key)
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0,
+            max_tokens=20,
+        )
+        ticker = response.choices[0].message.content.strip().upper()
+        # Basic sanity: should be short, alphanumeric-ish.
+        if ticker and len(ticker) <= 12:
+            return ticker
+    except Exception as exc:
+        print(f"  [!] LLM request failed: {exc}")
+
+    return None
+
+
+# ------------------------------------------------------------------
+# Core resolution
+# ------------------------------------------------------------------
+
+def _search_conid(client: IBKRClient, query: str,
+                  mic: str | None,
+                  by_name: bool = False,
+                  ) -> tuple[int, str | None, str | None] | None:
+    """Run a single secdef/search for *query*.
+
+    Parameters
+    ----------
+    by_name : bool
+        If True, pass ``name=True`` to the API so the query is treated
+        as a company name rather than a ticker symbol.
+
+    Returns
+    -------
+    tuple[int, str | None, str | None] | None
+        (conid, companyName, symbol) on success, None on failure.
+    """
+    try:
+        results = client.search_secdef(query, sec_type="STK", name=by_name)
+    except Exception as exc:
+        print(f"  [!] secdef/search failed for '{query}': {exc}")
+        return None
+
+    if not isinstance(results, list):
+        return None
+
+    match = _match_exchange(results, mic)
+    if match is None:
+        return None
+
+    raw_name = match.get("companyName") or match.get("companyHeader") or ""
+    # Strip exchange suffixes: "APPLE INC - NASDAQ" or "APPLE INC (NASDAQ)"
+    company_name = raw_name.split("(")[0].rsplit(" - ", 1)[0].strip() or None
+    symbol = match.get("symbol")
+
+    conid = match.get("conid")
+    if conid is not None:
+        return int(conid), company_name, symbol
+
+    for section in match.get("sections", []):
+        if isinstance(section, dict) and "conid" in section:
+            return int(section["conid"]), company_name, symbol
+
+    return None
+
+
+def _resolve_stock_conid(client: IBKRClient, symbol: str,
+                         mic: str | None,
+                         name: str | None = None,
+                         ) -> tuple[int, str | None, str | None] | None:
+    """Search for a stock by symbol and return (conid, api_name, api_symbol).
+
+    Fallback chain:
+      1. Search by company *name* (if provided, with name=true flag).
+      2. Search by *symbol* (ticker).
+      3. Ask LLM for the IBKR ticker, then search again.
+
+    A name-mismatch warning is printed when resolution falls back to the
+    ticker or LLM path (i.e. the name-based search failed or was skipped).
+    """
+    # --- Attempt 1: search by company name (preferred) ---
+    if name:
+        result = _search_conid(client, name, mic, by_name=True)
+        if result is not None:
+            return result
+        print(f"  [~] Name '{name}' not found via name search.")
+
+    # --- Attempt 2: search by ticker symbol ---
+    result = _search_conid(client, symbol, mic)
+    if result is not None:
+        _, api_name, _ = result
+        if name and api_name:
+            print(f"  [!] Resolved via ticker fallback. "
+                  f"Name mismatch: portfolio='{name}' vs API='{api_name}'")
+        return result
+
+    print(f"  [~] Ticker '{symbol}' also not found.")
+
+    # --- Attempt 3: ask LLM for the ticker ---
+    if name:
+        print(f"  [~] Asking LLM for IBKR ticker for '{name}' ...")
+        suggested = _ask_llm_for_ticker(name, mic)
+        if suggested and suggested != symbol.upper():
+            print(f"  [~] LLM suggested '{suggested}', searching ...")
+            result = _search_conid(client, suggested, mic)
+            if result is not None:
+                _, api_name, _ = result
+                if api_name:
+                    print(f"  [!] Resolved via LLM. "
+                          f"Name mismatch: portfolio='{name}' vs API='{api_name}'")
+                return result
+            print(f"  [!] LLM suggestion '{suggested}' also not found.")
+        elif not suggested:
+            print(f"  [!] LLM fallback unavailable (check {OPENAI_API_KEY_FILE}).")
+
+    print(f"  [!] Could not resolve conid for '{symbol}'.")
+    return None
+
+
+def _extract_underlying_from_name(name: str | None) -> str | None:
+    """Try to extract the underlying symbol from an option name.
+
+    Examples:
+      "February 26 Puts on SPX"   -> "SPX"
+      "March 26 Calls on FXI US"  -> "FXI"
+    """
+    if not name:
+        return None
+    import re
+    m = re.search(r"(?:Calls|Puts) on (\S+)", name)
+    if m:
+        symbol = m.group(1)
+        # Strip trailing exchange suffix if present (e.g. "FXI US" -> just "FXI").
+        parts = symbol.split()
+        return parts[0] if parts else None
+    return None
+
+
+def _resolve_option_conid(client: IBKRClient, ticker: str,
+                          mic: str | None,
+                          name: str | None = None,
+                          ) -> tuple[int, str | None, str | None] | None:
+    """Resolve an option conid via the underlying + secdef/info.
+
+    Returns (conid, api_name, api_symbol) or None.
+    """
+    m = _OPT_TICKER_RE.match(ticker.strip())
+    if not m:
+        print(f"  [!] Could not parse option ticker '{ticker}'")
+        return None
+
+    underlying = m.group("underlying")
+    month_num = m.group("month")
+    right = m.group("right")  # "C" or "P"
+    strike = float(m.group("strike"))
+
+    # For options we use ticker-first logic (names are not useful here).
+    # Try to extract a cleaner underlying symbol from the Name column
+    # (e.g. "February 26 Puts on SPX" -> "SPX"), which may differ from
+    # the ticker-derived underlying (e.g. "SPXW").
+    name_underlying = _extract_underlying_from_name(name)
+
+    # Step 1a – try the ticker-derived underlying first.
+    underlying_result = _search_conid(client, underlying, None)
+
+    # Step 1b – if the name gives a different underlying, try that next.
+    if underlying_result is None and name_underlying and name_underlying != underlying:
+        print(f"  [~] Trying underlying '{name_underlying}' extracted from name ...")
+        underlying_result = _search_conid(client, name_underlying, None)
+
+    # Step 1c – last resort: ask LLM for the underlying ticker.
+    if underlying_result is None and name:
+        print(f"  [~] Asking LLM for IBKR underlying ticker for '{name}' ...")
+        suggested = _ask_llm_for_ticker(name, None)
+        if suggested and suggested.upper() not in (underlying.upper(),
+                                                    (name_underlying or "").upper()):
+            print(f"  [~] LLM suggested '{suggested}', searching ...")
+            underlying_result = _search_conid(client, suggested, None)
+
+    if underlying_result is None:
+        print(f"  [!] Could not resolve underlying for option '{ticker}'")
+        return None
+
+    underlying_conid, _, _ = underlying_result
+
+    # Build the month string IBKR expects (e.g. "MAR26").
+    month_str = MONTH_MAP.get(month_num, month_num)
+    current_year_short = str(datetime.now().year)[-2:]
+    ibkr_month = f"{month_str}{current_year_short}"
+
+    # Step 2 – query option info.
+    try:
+        results = client.get_secdef_info(
+            conid=underlying_conid,
+            sec_type="OPT",
+            month=ibkr_month,
+            right=right,
+            strike=strike,
+        )
+    except Exception as exc:
+        print(f"  [!] secdef/info failed for {ticker}: {exc}")
+        return None
+
+    if not results:
+        print(
+            f"  [!] No option contract found for {ticker} "
+            f"(underlying conid={underlying_conid}, "
+            f"month={ibkr_month}, right={right}, strike={strike})"
+        )
+        return None
+
+    # Take the first matching contract.
+    first = results[0] if isinstance(results[0], dict) else {}
+    conid = first.get("conid")
+    # Capture the option's description and symbol from the API response.
+    api_name = first.get("desc2") or first.get("desc1")
+    api_symbol = first.get("symbol") or first.get("tradingClass")
+    if conid is not None:
+        return int(conid), api_name, api_symbol
+    return None
+
+
+# ------------------------------------------------------------------
+# Public API
+# ------------------------------------------------------------------
+
+def resolve_conids(client: IBKRClient, df: pd.DataFrame) -> pd.DataFrame:
+    """Add a ``conid`` column to *df* by querying the IBKR API.
+
+    Parameters
+    ----------
+    client : IBKRClient
+        Authenticated API client.
+    df : pd.DataFrame
+        Portfolio table with ``clean_ticker``, ``is_option``, ``Name``,
+        and ``MIC Primary Exchange`` columns.
+
+    Returns
+    -------
+    pd.DataFrame
+        The same DataFrame with an added ``conid`` column.
+    """
+    conids: list[int | None] = []
+    api_names: list[str | None] = []
+    api_tickers: list[str | None] = []
+    total = len(df)
+
+    for idx, row in df.iterrows():
+        ticker = row["clean_ticker"]
+        mic = _safe_mic(row.get("MIC Primary Exchange"))
+        name = row.get("Name")
+        name = str(name).strip() if pd.notna(name) else None
+        is_opt = row["is_option"]
+        label = f"[{idx + 1}/{total}]"
+
+        if is_opt:
+            raw_ticker = str(row.get("Ticker", "")).strip()
+            print(f"  {label} Resolving option '{raw_ticker}' ...")
+            result = _resolve_option_conid(client, raw_ticker, mic, name)
+        else:
+            print(f"  {label} Resolving stock  '{ticker}' ...")
+            result = _resolve_stock_conid(client, ticker, mic, name)
+
+        if result is not None:
+            cid, r_name, r_symbol = result
+            conids.append(cid)
+            api_names.append(r_name)
+            api_tickers.append(r_symbol)
+        else:
+            conids.append(None)
+            api_names.append(None)
+            api_tickers.append(None)
+
+        # Small delay to respect rate limits.
+        time.sleep(0.15)
+
+    df["conid"] = conids
+    df["IBKR Name"] = api_names
+    df["IBKR Ticker"] = api_tickers
+
+    # Flag rows where the portfolio name differs from the IBKR name.
+    def _names_differ(row):
+        orig = row.get("Name")
+        ibkr = row.get("IBKR Name")
+        if pd.isna(orig) or pd.isna(ibkr):
+            return None
+        return str(orig).strip().upper() != str(ibkr).strip().upper()
+
+    df["Name Mismatch"] = df.apply(_names_differ, axis=1)
+
+    resolved = df["conid"].notna().sum()
+    failed = total - resolved
+    print(f"\nResolved {resolved}/{total} conids.")
+    if failed:
+        unresolved = df[df["conid"].isna()][["clean_ticker", "Name"]].to_string(index=False)
+        print(f"Unresolved ({failed}):\n{unresolved}")
+    print()
+    return df
