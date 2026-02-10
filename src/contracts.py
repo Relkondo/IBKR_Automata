@@ -11,6 +11,7 @@ Fallback chain when a ticker is not found:
 """
 
 import os
+import re
 import time
 from datetime import datetime
 
@@ -40,8 +41,105 @@ def _safe_mic(mic) -> str | None:
 # Helpers – exchange matching
 # ------------------------------------------------------------------
 
+# Mapping from IBKR's common exchange abbreviations (as they appear in
+# companyHeader, sections, or the exchange field) to ISO MIC codes.
+# This lets us compare the API result against the MIC Primary Exchange
+# column from the input spreadsheet.
+_IBKR_EXCHANGE_TO_MIC: dict[str, str] = {
+    # North America
+    "NYSE": "XNYS",
+    "NASDAQ": "XNAS",
+    "ARCA": "ARCX",
+    "AMEX": "XASE",
+    "BATS": "BATS",
+    "IEX": "IEXG",
+    "TSE": "XTSE",
+    "TSX": "XTSE",
+    "VENTURE": "XTSX",
+    "MEXI": "XMEX",
+    "PSE": "XPHL",
+    "PINK": "OTCM",
+    # South America
+    "B3": "BVMF",
+    "BVMF": "BVMF",
+    "BVL": "XLIM",
+    "BCS": "XSGO",
+    # Europe
+    "LSE": "XLON",
+    "LSEETF": "XLON",
+    "FWB": "XFRA",
+    "FWB2": "XFRA",
+    "SWX": "XSWX",
+    "IBIS": "XETR",
+    "IBIS2": "XETR",
+    "SBF": "XPAR",
+    "ENXTPA": "XPAR",
+    "AEB": "XAMS",
+    "BRU": "XBRU",
+    "LIS": "XLIS",
+    "MIL": "XMIL",
+    "BM": "XMAD",
+    "VSE": "XWBO",
+    "STO": "XSTO",
+    "CPH": "XCSE",
+    "HEL": "XHEL",
+    "OSE": "XOSL",
+    "WSE": "XWAR",
+    "IST": "XIST",
+    "ATH": "XATH",
+    "BUD": "XBUD",
+    "PRG": "XPRA",
+    # Asia-Pacific
+    "TSEJ": "XTKS",
+    "SEHK": "XHKG",
+    "HKSE": "XHKG",
+    "SGX": "XSES",
+    "ASX": "XASX",
+    "KSE": "XKRX",
+    "TWSE": "XTAI",
+    "SSE": "XSHG",
+    "SZSE": "XSHE",
+    "NSE": "XNSE",
+    "BSE": "XBOM",
+    "NZE": "XNZE",
+    # Middle East / Africa
+    "TASE": "XTAE",
+    "JSE": "XJSE",
+}
+
+
+def _exchange_to_mic(exchange: str) -> str:
+    """Convert an IBKR exchange abbreviation to a MIC code.
+
+    Falls back to returning the exchange string itself (uppercased) if
+    no mapping is found, so direct MIC-to-MIC comparisons still work.
+    """
+    return _IBKR_EXCHANGE_TO_MIC.get(exchange.upper(), exchange.upper())
+
+
+def _extract_header_exchange(entry: dict) -> str | None:
+    """Extract the exchange abbreviation from the companyHeader field.
+
+    companyHeader typically looks like ``"MAGNA INTERNATIONAL INC (NYSE)"``
+    — the exchange is the text inside the trailing parentheses.
+    """
+    header = entry.get("companyHeader") or ""
+    if header.endswith(")"):
+        start = header.rfind("(")
+        if start != -1:
+            return header[start + 1 : -1].strip()
+    return None
+
+
 def _match_exchange(results: list, mic: str | None) -> dict | None:
     """Pick the search result whose exchange best matches *mic*.
+
+    Matching strategy:
+      1. Check each entry's ``sections`` for an exchange matching *mic*.
+      2. Check each entry's top-level ``exchange`` field.
+      3. Extract the exchange from ``companyHeader`` (text in parentheses)
+         and convert it to a MIC code via the mapping table.
+      4. If nothing matches, return the first entry as default.
 
     Only dict entries are considered; non-dict items are skipped.
     """
@@ -55,11 +153,22 @@ def _match_exchange(results: list, mic: str | None) -> dict | None:
     if mic:
         mic_upper = mic.upper()
         for entry in dict_results:
+            # Try sections first.
             sections = entry.get("sections", [])
             for section in sections:
-                if isinstance(section, dict) and section.get("exchange", "").upper() == mic_upper:
-                    return entry
-            if entry.get("exchange", "").upper() == mic_upper:
+                if isinstance(section, dict):
+                    sec_exc = section.get("exchange", "")
+                    if _exchange_to_mic(sec_exc) == mic_upper:
+                        return entry
+
+            # Try top-level exchange field.
+            top_exc = entry.get("exchange", "")
+            if top_exc and _exchange_to_mic(top_exc) == mic_upper:
+                return entry
+
+            # Try extracting from companyHeader.
+            header_exc = _extract_header_exchange(entry)
+            if header_exc and _exchange_to_mic(header_exc) == mic_upper:
                 return entry
 
     return dict_results[0]
@@ -146,6 +255,13 @@ def _search_conid(client: IBKRClient, query: str,
     if not isinstance(results, list):
         return None
 
+    # The API sometimes returns entries with a different secType than
+    # requested (e.g. IND instead of STK).  Filter them out.
+    results = [
+        r for r in results
+        if isinstance(r, dict) and r.get("secType", "").upper() == "STK"
+    ]
+
     match = _match_exchange(results, mic)
     if match is None:
         return None
@@ -188,6 +304,8 @@ def _resolve_stock_conid(client: IBKRClient, symbol: str,
         print(f"  [~] Name '{name}' not found via name search.")
 
     # --- Attempt 2: search by ticker symbol ---
+    # Strip trailing Bloomberg-style tags like "US Equity" or "JP Index".
+    symbol = re.sub(r"\s+[A-Z]{2}\s+(?:Equity|Index)$", "", symbol, flags=re.IGNORECASE)
     result = _search_conid(client, symbol, mic)
     if result is not None:
         _, api_name, _ = result
@@ -246,7 +364,9 @@ def _resolve_option_conid(client: IBKRClient, ticker: str,
 
     Returns (conid, api_name, api_symbol) or None.
     """
-    m = _OPT_TICKER_RE.match(ticker.strip())
+    # Strip trailing category tags that some input files append.
+    clean = re.sub(r"\s+(?:Equity|Index)$", "", ticker.strip(), flags=re.IGNORECASE)
+    m = _OPT_TICKER_RE.match(clean)
     if not m:
         print(f"  [!] Could not parse option ticker '{ticker}'")
         return None
