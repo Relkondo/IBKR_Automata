@@ -131,47 +131,86 @@ def _extract_header_exchange(entry: dict) -> str | None:
     return None
 
 
-def _match_exchange(results: list, mic: str | None) -> dict | None:
+# Exchange redirects: for certain MIC codes, prefer trading on an
+# alternative exchange to sidestep lot-size restrictions (e.g. Japanese
+# and Hong Kong stocks often require buying in lots of 100+).
+# Each key is the original input MIC; the value is an ordered list of
+# MIC codes to try *instead*.  If none of the redirects are found in the
+# search results, the original MIC is still attempted as a last resort.
+_MIC_EXCHANGE_REDIRECTS: dict[str, list[str]] = {
+    "XTKS": ["XFRA", "OTCM"],   # FWB2, then PINK
+    "XHKG": ["XFRA", "OTCM"],   # FWB2, then PINK
+}
+
+
+def _find_entry_by_mic(dict_results: list[dict],
+                        target_mic: str) -> dict | None:
+    """Return the first entry whose exchange resolves to *target_mic*."""
+    for entry in dict_results:
+        # Try sections.
+        for section in entry.get("sections", []):
+            if isinstance(section, dict):
+                sec_exc = section.get("exchange", "")
+                if exchange_to_mic(sec_exc) == target_mic:
+                    return entry
+
+        # Try top-level exchange field.
+        top_exc = entry.get("exchange", "")
+        if top_exc and exchange_to_mic(top_exc) == target_mic:
+            return entry
+
+        # Try companyHeader.
+        header_exc = _extract_header_exchange(entry)
+        if header_exc and exchange_to_mic(header_exc) == target_mic:
+            return entry
+
+    return None
+
+
+def _match_exchange(results: list,
+                    mic: str | None) -> tuple[dict | None, str | None]:
     """Pick the search result whose exchange best matches *mic*.
 
     Matching strategy:
-      1. Check each entry's ``sections`` for an exchange matching *mic*.
-      2. Check each entry's top-level ``exchange`` field.
-      3. Extract the exchange from ``companyHeader`` (text in parentheses)
-         and convert it to a MIC code via the mapping table.
-      4. If nothing matches, return the first entry as default.
+      1. If *mic* has exchange redirects (e.g. XTKS -> FWB2/PINK), try
+         each redirect MIC in order.
+      2. Fall back to a direct match on the original *mic*.
+      3. If nothing matches, return the first entry as default.
 
     Only dict entries are considered; non-dict items are skipped.
+
+    Returns
+    -------
+    (entry, effective_mic) : tuple[dict | None, str | None]
+        The matched entry and the MIC code that was actually matched.
+        *effective_mic* differs from *mic* when a redirect was used.
+        ``(None, None)`` when no results are available.
     """
     if not results:
-        return None
+        return None, None
 
     dict_results = [e for e in results if isinstance(e, dict)]
     if not dict_results:
-        return None
+        return None, None
 
     if mic:
         mic_upper = mic.upper()
-        for entry in dict_results:
-            # Try sections first.
-            sections = entry.get("sections", [])
-            for section in sections:
-                if isinstance(section, dict):
-                    sec_exc = section.get("exchange", "")
-                    if exchange_to_mic(sec_exc) == mic_upper:
-                        return entry
 
-            # Try top-level exchange field.
-            top_exc = entry.get("exchange", "")
-            if top_exc and exchange_to_mic(top_exc) == mic_upper:
-                return entry
+        # Try redirect exchanges first (e.g. FWB2 / PINK for Asian markets).
+        redirects = _MIC_EXCHANGE_REDIRECTS.get(mic_upper, [])
+        for redirect_mic in redirects:
+            match = _find_entry_by_mic(dict_results, redirect_mic)
+            if match is not None:
+                print(f"    [i] Redirected from {mic_upper} to "
+                      f"{redirect_mic} (exchange redirect)")
+                return match, redirect_mic
 
-            # Try extracting from companyHeader.
-            header_exc = _extract_header_exchange(entry)
-            if header_exc and exchange_to_mic(header_exc) == mic_upper:
-                return entry
+        # Direct match on the original MIC.
+        match = _find_entry_by_mic(dict_results, mic_upper)
+        if match is not None:
+            return match, mic_upper
 
-    return dict_results[0]
+    return dict_results[0], mic
 
 
 # ------------------------------------------------------------------
@@ -232,7 +271,7 @@ def _ask_llm_for_ticker(name: str, mic: str | None) -> str | None:
 def _search_conid(client: IBKRClient, query: str,
                   mic: str | None,
                   by_name: bool = False,
-                  ) -> tuple[int, str | None, str | None] | None:
+                  ) -> tuple[int, str | None, str | None, str | None] | None:
     """Run a single secdef/search for *query*.
 
     Parameters
@@ -243,8 +282,10 @@ def _search_conid(client: IBKRClient, query: str,
 
     Returns
     -------
-    tuple[int, str | None, str | None] | None
-        (conid, companyName, symbol) on success, None on failure.
+    tuple[int, str | None, str | None, str | None] | None
+        ``(conid, companyName, symbol, effective_mic)`` on success,
+        ``None`` on failure.  *effective_mic* is the MIC code that was
+        actually matched (may differ from *mic* when a redirect was used).
     """
     try:
         results = client.search_secdef(query, sec_type="STK", name=by_name)
@@ -262,7 +303,7 @@ def _search_conid(client: IBKRClient, query: str,
         if isinstance(r, dict) and r.get("secType", "").upper() == "STK"
     ]
 
-    match = _match_exchange(results, mic)
+    match, effective_mic = _match_exchange(results, mic)
     if match is None:
         return None
 
@@ -273,11 +314,11 @@ def _search_conid(client: IBKRClient, query: str,
 
     conid = match.get("conid")
     if conid is not None:
-        return int(conid), company_name, symbol
+        return int(conid), company_name, symbol, effective_mic
 
     for section in match.get("sections", []):
         if isinstance(section, dict) and "conid" in section:
-            return int(section["conid"]), company_name, symbol
+            return int(section["conid"]), company_name, symbol, effective_mic
 
     return None
 
@@ -285,16 +326,16 @@ def _search_conid(client: IBKRClient, query: str,
 def _resolve_stock_conid(client: IBKRClient, symbol: str,
                          mic: str | None,
                          name: str | None = None,
-                         ) -> tuple[int, str | None, str | None] | None:
-    """Search for a stock by symbol and return (conid, api_name, api_symbol).
+                         ) -> tuple[int, str | None, str | None, str | None] | None:
+    """Search for a stock and return (conid, api_name, api_symbol, effective_mic).
 
     Fallback chain:
       1. Search by company *name* (if provided, with name=true flag).
       2. Search by *symbol* (ticker).
       3. Ask LLM for the IBKR ticker, then search again.
 
-    A name-mismatch warning is printed when resolution falls back to the
-    ticker or LLM path (i.e. the name-based search failed or was skipped).
+    *effective_mic* is the MIC code that was actually matched (may differ
+    from the input *mic* when an exchange redirect was applied).
     """
     # --- Attempt 1: search by company name (preferred) ---
     if name:
@@ -308,7 +349,7 @@ def _resolve_stock_conid(client: IBKRClient, symbol: str,
     symbol = re.sub(r"\s+[A-Z]{2}\s+(?:Equity|Index)$", "", symbol, flags=re.IGNORECASE)
     result = _search_conid(client, symbol, mic)
     if result is not None:
-        _, api_name, _ = result
+        _, api_name, _, _ = result
         if name and api_name:
             print(f"  [!] Resolved via ticker fallback. "
                   f"Name mismatch: portfolio='{name}' vs API='{api_name}'")
@@ -324,7 +365,7 @@ def _resolve_stock_conid(client: IBKRClient, symbol: str,
             print(f"  [~] LLM suggested '{suggested}', searching ...")
             result = _search_conid(client, suggested, mic)
             if result is not None:
-                _, api_name, _ = result
+                _, api_name, _, _ = result
                 if api_name:
                     print(f"  [!] Resolved via LLM. "
                           f"Name mismatch: portfolio='{name}' vs API='{api_name}'")
@@ -359,10 +400,12 @@ def _extract_underlying_from_name(name: str | None) -> str | None:
 def _resolve_option_conid(client: IBKRClient, ticker: str,
                           mic: str | None,
                           name: str | None = None,
-                          ) -> tuple[int, str | None, str | None] | None:
+                          ) -> tuple[int, str | None, str | None, str | None] | None:
     """Resolve an option conid via the underlying + secdef/info.
 
-    Returns (conid, api_name, api_symbol) or None.
+    Returns ``(conid, api_name, api_symbol, effective_mic)`` or ``None``.
+    Options don't use exchange redirects, so *effective_mic* is always
+    the original *mic*.
     """
     # Strip trailing category tags that some input files append.
     clean = re.sub(r"\s+(?:Equity|Index)$", "", ticker.strip(), flags=re.IGNORECASE)
@@ -403,7 +446,7 @@ def _resolve_option_conid(client: IBKRClient, ticker: str,
         print(f"  [!] Could not resolve underlying for option '{ticker}'")
         return None
 
-    underlying_conid, _, _ = underlying_result
+    underlying_conid, _, _, _ = underlying_result
 
     # Build the month string IBKR expects (e.g. "MAR26").
     month_str = MONTH_MAP.get(month_num, month_num)
@@ -438,7 +481,7 @@ def _resolve_option_conid(client: IBKRClient, ticker: str,
     api_name = first.get("desc2") or first.get("desc1")
     api_symbol = first.get("symbol") or first.get("tradingClass")
     if conid is not None:
-        return int(conid), api_name, api_symbol
+        return int(conid), api_name, api_symbol, mic
     return None
 
 
@@ -465,6 +508,7 @@ def resolve_conids(client: IBKRClient, df: pd.DataFrame) -> pd.DataFrame:
     conids: list[int | None] = []
     api_names: list[str | None] = []
     api_tickers: list[str | None] = []
+    effective_mics: list[str | None] = []
     total = len(df)
 
     for idx, row in df.iterrows():
@@ -484,14 +528,16 @@ def resolve_conids(client: IBKRClient, df: pd.DataFrame) -> pd.DataFrame:
             result = _resolve_stock_conid(client, ticker, mic, name)
 
         if result is not None:
-            cid, r_name, r_symbol = result
+            cid, r_name, r_symbol, eff_mic = result
             conids.append(cid)
             api_names.append(r_name)
             api_tickers.append(r_symbol)
+            effective_mics.append(eff_mic)
         else:
             conids.append(None)
             api_names.append(None)
             api_tickers.append(None)
+            effective_mics.append(mic)
 
         # Small delay to respect rate limits.
         time.sleep(0.15)
@@ -499,6 +545,11 @@ def resolve_conids(client: IBKRClient, df: pd.DataFrame) -> pd.DataFrame:
     df["conid"] = conids
     df["IBKR Name"] = api_names
     df["IBKR Ticker"] = api_tickers
+
+    # Update MIC Primary Exchange to the actual exchange we resolved to.
+    # This ensures that downstream filtering (e.g. open-exchange checks)
+    # uses the redirected exchange rather than the original input.
+    df["MIC Primary Exchange"] = effective_mics
 
     # Flag rows where the portfolio name differs from the IBKR name.
     def _names_differ(row):

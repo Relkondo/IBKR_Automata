@@ -30,7 +30,7 @@ from src.orders import cancel_all_orders, get_account_id
 # ---------------------------------------------------------------------------
 
 CACHE_READY_FILE = os.path.join(ASSETS_DIR, ".cache_ready")
-CACHE_READY_WAIT_MINUTES = 30
+CACHE_READY_WAIT_MINUTES = 3
 
 
 # ---------------------------------------------------------------------------
