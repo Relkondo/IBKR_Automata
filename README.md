@@ -72,8 +72,14 @@ On launch, the program starts the Client Portal Gateway and asks you to authenti
 | `noop-recalculate` | Re-use contract IDs from a previously saved `Project_Portfolio.csv` but re-fetch live market data and recompute limit prices. Skips order placement. |
 | `project-portfolio` | Skip steps 2-3 entirely — load an existing `output/Project_Portfolio.csv` and jump straight to the interactive order loop. |
 | `buy-all` | Skip reconciliation — order the full target quantities from `Project_Portfolio` regardless of existing positions or pending orders on IBKR. |
+| `cancel-all-orders` | Cancel every open order on the account and exit. The positions cache is re-invalidated afterwards so it starts reloading. |
+| `get-cache-ready` | Cancel all orders, invalidate the gateway's positions cache, and record a timestamp. The cache takes ~30 min to fully reload; ordering modes will block until enough time has elapsed. |
+| `print-project-vs-actual` | Load `Project_Portfolio.csv` and current IBKR positions, then output an Excel comparison (`output/Project_VS_Actual.xlsx`) showing target vs actual allocations. |
+| `-all-exchanges` | Operate on **all** exchanges regardless of trading hours. By default, only currently open exchanges are considered when placing or cancelling orders. Has no effect with `noop` or `noop-recalculate`. Compatible with all other arguments. |
 
-`noop`, `noop-recalculate`, and `project-portfolio` are mutually exclusive. `buy-all` can be combined with `project-portfolio`.
+`noop`, `noop-recalculate`, `project-portfolio`, `cancel-all-orders`, `get-cache-ready`, and `print-project-vs-actual` are mutually exclusive. `buy-all` can be combined with `project-portfolio`.
+
+> **Cache workflow**: Before placing orders for the first time in a session (or after a previous order run), run `get-cache-ready` and wait ~30 minutes for the gateway's positions cache to reload. Ordering modes will automatically check the cache timestamp and refuse to proceed if the cache is too fresh. After placing or cancelling orders, the cache is automatically re-invalidated.
 
 ### Examples
 
@@ -92,6 +98,21 @@ python -m src.main buy-all
 
 # Place orders from a previously saved Project_Portfolio.csv
 python -m src.main project-portfolio
+
+# Full run, including exchanges that are currently closed
+python -m src.main -all-exchanges
+
+# Cancel all open orders (only on currently open exchanges)
+python -m src.main cancel-all-orders
+
+# Cancel all open orders regardless of exchange hours
+python -m src.main cancel-all-orders -all-exchanges
+
+# Prepare cache for ordering (cancel orders + invalidate + record timestamp)
+python -m src.main get-cache-ready
+
+# Compare Project_Portfolio targets against actual IBKR positions
+python -m src.main print-project-vs-actual
 ```
 
 ### Interactive order loop
@@ -144,6 +165,9 @@ IBKR_Automata/
 │   ├── portfolio.py         # Excel loading & preprocessing
 │   ├── contracts.py         # Contract ID resolution (stocks, options, fallbacks)
 │   ├── market_data.py       # Market data polling & limit price computation
+│   ├── exchange_hours.py    # Exchange trading hours & open/closed filtering
+│   ├── cache.py             # Cache readiness management (invalidate / check / prepare)
+│   ├── comparison.py        # Project_Portfolio vs actual IBKR positions
 │   ├── reconcile.py         # Reconciliation against IBKR positions & orders
 │   └── orders.py            # Interactive order placement loop
 ├── requirements.txt

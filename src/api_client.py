@@ -214,13 +214,14 @@ class IBKRClient:
     def get_positions(self, account_id: str) -> list[dict]:
         """Retrieve all portfolio positions across all pages.
 
-        The correct sequence for reliable position data is:
+        A priming call to ``GET /portfolio/accounts`` is issued first to
+        ensure the portfolio subsystem is awake.  Cache *invalidation* is
+        handled externally by ``src.cache`` so that it can be decoupled
+        from reads (the cache needs 10-30 min to reload).
 
-        1. ``GET /portfolio/accounts`` – prime the portfolio subsystem.
-        2. ``POST /portfolio/{accountId}/positions/invalidate`` – force a
-           cache refresh so the gateway fetches fresh data from the
-           IBKR backend.
-        3. Paginate ``GET /portfolio/{accountId}/positions/{pageId}``.
+        Each page carries a ``pageSize`` field.  If the actual item count
+        is lower than ``pageSize``, the page is retried a few times in
+        case the cache is still settling.
 
         Returns
         -------
@@ -228,21 +229,12 @@ class IBKRClient:
             Flat list of position dicts, each containing at least
             ``conid``, ``position``, ``contractDesc``, ``mktValue``, etc.
         """
-        # 1. Prime the portfolio subsystem.
+        import time
+
+        # Prime the portfolio subsystem.
         self.session.get(f"{self.base_url}/portfolio/accounts")
 
-        # 2. Invalidate the backend cache to force a fresh load.
-        # self.invalidate_positions_cache(account_id)
-
-        # 3. Wait for the backend to repopulate the cache.
-        import time
-        # time.sleep(3)
-
-        # 4. Paginate positions.
-        #    Each item in a page carries a ``pageSize`` field indicating
-        #    how many items the page *should* contain.  If the actual
-        #    count is lower, the cache hasn't fully loaded yet; we retry
-        #    the same page after a short delay until it is complete.
+        # Paginate positions with pageSize-based retry.
         MAX_PAGE_RETRIES = 10
         RETRY_DELAY = 0.5  # seconds
 

@@ -21,6 +21,10 @@ CLI arguments
   buy-all             Skip reconciliation – order the full Project_Portfolio
                       quantities regardless of existing IBKR positions.
   cancel-all-orders   Cancel every open order on the account and exit.
+  get-cache-ready     Cancel all orders, invalidate the gateway's positions
+                      cache, and record a timestamp.  The user must wait
+                      ~30 min before the cache is reliable enough for
+                      ordering.
   print-project-vs-actual
                       Load Project_Portfolio.csv and current IBKR positions,
                       then output an Excel comparison to output/.
@@ -35,6 +39,11 @@ import sys
 import pandas as pd
 
 from src.api_client import IBKRClient
+from src.cache import (
+    check_cache_ready,
+    invalidate_and_record,
+    run_get_cache_ready,
+)
 from src.config import OUTPUT_DIR
 from src.gateway import launch_gateway, wait_for_auth, SessionKeepalive
 from src.portfolio import load_portfolio
@@ -42,7 +51,7 @@ from src.contracts import resolve_conids
 from src.market_data import fetch_market_data, resolve_currencies, save_project_portfolio
 from src.comparison import generate_project_vs_actual
 from src.exchange_hours import filter_df_by_open_exchange
-from src.orders import cancel_all_orders, run_order_loop, print_order_summary
+from src.orders import cancel_all_orders, get_account_id, run_order_loop, print_order_summary
 from src.reconcile import reconcile
 
 
@@ -59,6 +68,32 @@ def _load_project_portfolio() -> pd.DataFrame:
     return df
 
 
+def _ensure_cache_ready(client: IBKRClient,
+                        all_exchanges: bool) -> bool:
+    """Check cache readiness; offer to prepare if needed.
+
+    Returns ``True`` if the caller may proceed with ordering,
+    ``False`` if it should abort.
+    """
+    ready, msg = check_cache_ready()
+    if ready:
+        return True
+
+    print(f"[!] {msg}\n")
+
+    # If the cache was invalidated recently, just tell the user to wait.
+    if "need to wait" in msg:
+        print("Please re-run once the wait time has elapsed.\n")
+        return False
+
+    # Cache has never been prepared (or file is missing).
+    answer = input("Run get-cache-ready now? [Y/N] > ").strip().upper()
+    if answer == "Y":
+        run_get_cache_ready(client, all_exchanges=all_exchanges)
+        print("Please re-run once the wait time has elapsed.\n")
+    return False
+
+
 def main() -> None:
     args = sys.argv[1:]
     noop = "noop" in args
@@ -66,18 +101,22 @@ def main() -> None:
     use_saved = "project-portfolio" in args
     buy_all = "buy-all" in args
     cancel_all = "cancel-all-orders" in args
+    get_cache = "get-cache-ready" in args
     print_comparison = "print-project-vs-actual" in args
     all_exchanges = "-all-exchanges" in args
 
     # Mutual exclusivity checks.
-    mode_flags = sum([noop, noop_recalc, use_saved, cancel_all, print_comparison])
+    mode_flags = sum([noop, noop_recalc, use_saved, cancel_all,
+                      get_cache, print_comparison])
     if mode_flags > 1:
         print("Error: 'noop', 'noop-recalculate', 'project-portfolio', "
-              "'cancel-all-orders', and 'print-project-vs-actual' "
-              "are mutually exclusive.")
+              "'cancel-all-orders', 'get-cache-ready', and "
+              "'print-project-vs-actual' are mutually exclusive.")
         sys.exit(1)
 
-    if print_comparison:
+    if get_cache:
+        print("Running in GET-CACHE-READY mode.\n")
+    elif print_comparison:
         print("Running in PRINT-PROJECT-VS-ACTUAL mode.\n")
     elif cancel_all:
         print("Running in CANCEL-ALL-ORDERS mode.\n")
@@ -114,15 +153,37 @@ def main() -> None:
     keepalive.start()
 
     try:
-        if print_comparison:
+        # ==============================================================
+        # get-cache-ready  (standalone mode)
+        # ==============================================================
+        if get_cache:
+            run_get_cache_ready(client, all_exchanges=all_exchanges)
+
+        # ==============================================================
+        # print-project-vs-actual  (standalone mode)
+        # ==============================================================
+        elif print_comparison:
             generate_project_vs_actual(client)
+
+        # ==============================================================
+        # cancel-all-orders  (standalone mode)
+        # ==============================================================
         elif cancel_all:
             cancel_all_orders(client, all_exchanges=all_exchanges)
+            # Invalidate cache so it starts reloading after cancellations.
+            account_id = get_account_id(client)
+            invalidate_and_record(client, account_id)
+
+        # ==============================================================
+        # project-portfolio  (load saved CSV, skip steps 2-5)
+        # ==============================================================
         elif use_saved:
-            # Load the previously generated CSV directly.
             df = _load_project_portfolio()
+
+        # ==============================================================
+        # noop-recalculate  (re-fetch market data for existing conids)
+        # ==============================================================
         elif noop_recalc:
-            # Load saved CSV (with conids), re-fetch market data, re-save.
             df = _load_project_portfolio()
 
             # ----------------------------------------------------------
@@ -139,6 +200,10 @@ def main() -> None:
             # 5. Save Project_Portfolio.csv
             # ----------------------------------------------------------
             save_project_portfolio(df)
+
+        # ==============================================================
+        # Normal run  (full pipeline: steps 2-5)
+        # ==============================================================
         else:
             # ----------------------------------------------------------
             # 2. Read portfolio
@@ -166,30 +231,48 @@ def main() -> None:
             # ----------------------------------------------------------
             save_project_portfolio(df)
 
-        if not noop and not noop_recalc and not cancel_all and not print_comparison:
-            # ----------------------------------------------------------
-            # 5b. Reconcile against IBKR state (unless buy-all)
-            # ----------------------------------------------------------
-            if not buy_all:
-                print("Reconciling target portfolio with IBKR state ...\n")
-                df = reconcile(client, df, all_exchanges=all_exchanges)
+        # ==============================================================
+        # Ordering section  (applicable to normal, project-portfolio,
+        # and buy-all modes)
+        # ==============================================================
+        if not noop and not noop_recalc and not cancel_all \
+                and not print_comparison and not get_cache:
 
-            # ----------------------------------------------------------
-            # 5c. Filter to open exchanges (unless -all-exchanges)
-            # ----------------------------------------------------------
-            if not all_exchanges:
-                print("Filtering to currently open exchanges ...\n")
-                df = filter_df_by_open_exchange(df)
+            # --- Cache readiness gate --------------------------------
+            if not _ensure_cache_ready(client, all_exchanges):
+                # User chose not to proceed or must wait.
+                print("Aborting order placement.\n")
+            else:
+                # ----------------------------------------------------------
+                # 5b. Reconcile against IBKR state (unless buy-all)
+                # ----------------------------------------------------------
+                if not buy_all:
+                    print("Reconciling target portfolio with IBKR state ...\n")
+                    df = reconcile(client, df, all_exchanges=all_exchanges)
 
-            # ----------------------------------------------------------
-            # 6. Interactive order loop
-            # ----------------------------------------------------------
-            placed = run_order_loop(client, df)
+                # ----------------------------------------------------------
+                # 5c. Filter to open exchanges (unless -all-exchanges)
+                # ----------------------------------------------------------
+                if not all_exchanges:
+                    print("Filtering to currently open exchanges ...\n")
+                    df = filter_df_by_open_exchange(df)
 
-            # ----------------------------------------------------------
-            # 7. Summary
-            # ----------------------------------------------------------
-            print_order_summary(placed)
+                # ----------------------------------------------------------
+                # 6. Interactive order loop
+                # ----------------------------------------------------------
+                placed = run_order_loop(client, df)
+
+                # ----------------------------------------------------------
+                # 7. Summary
+                # ----------------------------------------------------------
+                print_order_summary(placed)
+
+                # ----------------------------------------------------------
+                # 7b. Re-invalidate cache (orders changed IBKR state)
+                # ----------------------------------------------------------
+                account_id = get_account_id(client)
+                invalidate_and_record(client, account_id)
+
         elif noop or noop_recalc:
             print("\nNOOP mode -- skipping order placement. "
                   "Review Project_Portfolio.csv in the output directory."
