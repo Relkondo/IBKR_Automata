@@ -34,21 +34,25 @@ def _latest_xlsx(directory: str) -> str:
     return max(xlsx_files, key=os.path.getmtime)
 
 
-# Regex that matches option-style tickers, e.g. "FXI 3 C44 US"
-# Pattern: UNDERLYING <month_num> <C|P><strike> <exchange_suffix>
+# Regex that matches option-style tickers, e.g. "QQQ US 02/27/26 P600 Equity"
+# Pattern: UNDERLYING <country> <MM/DD/YY> <C|P><strike> <suffix>
 _OPT_TICKER_RE = re.compile(
-    r"^(?P<underlying>[A-Z]+)"      # underlying symbol
-    r"\s+(?P<month>\d{1,2})"        # month number (1-12)
-    r"\s+(?P<right>[CP])"           # C = Call, P = Put
-    r"(?P<strike>[\d.]+)"           # strike price
-    r"\s+(?P<suffix>[A-Z]+)$"       # exchange suffix
+    r"^(?P<underlying>[A-Z]+)"           # underlying symbol
+    r"\s+[A-Z]{2}"                       # country code (ignored)
+    r"\s+(?P<month>\d{2})/(?P<day>\d{2})/(?P<year>\d{2})"  # MM/DD/YY
+    r"\s+(?P<right>[CP])"                # C = Call, P = Put
+    r"(?P<strike>[\d.]+)"               # strike price
+    r"(?:\s+\S+)?$"                      # optional trailing suffix (e.g. Equity)
 )
 
 # Month number -> IBKR short month string (used later for secdef queries).
+# Accepts both zero-padded ("02") and unpadded ("2") keys.
 MONTH_MAP = {
-    "1": "JAN", "2": "FEB", "3": "MAR", "4": "APR",
-    "5": "MAY", "6": "JUN", "7": "JUL", "8": "AUG",
-    "9": "SEP", "10": "OCT", "11": "NOV", "12": "DEC",
+    "1": "JAN", "01": "JAN", "2": "FEB", "02": "FEB",
+    "3": "MAR", "03": "MAR", "4": "APR", "04": "APR",
+    "5": "MAY", "05": "MAY", "6": "JUN", "06": "JUN",
+    "7": "JUL", "07": "JUL", "8": "AUG", "08": "AUG",
+    "9": "SEP", "09": "SEP", "10": "OCT", "11": "NOV", "12": "DEC",
 }
 
 

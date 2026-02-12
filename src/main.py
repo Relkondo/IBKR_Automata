@@ -89,7 +89,7 @@ def _ensure_cache_ready(client: IBKRClient,
     # Cache has never been prepared (or file is missing).
     answer = input("Run get-cache-ready now? [Y/N] > ").strip().upper()
     if answer == "Y":
-        run_get_cache_ready(client, all_exchanges=all_exchanges)
+        run_get_cache_ready(client)
         print("Please re-run once the wait time has elapsed.\n")
     return False
 
@@ -157,7 +157,7 @@ def main() -> None:
         # get-cache-ready  (standalone mode)
         # ==============================================================
         if get_cache:
-            run_get_cache_ready(client, all_exchanges=all_exchanges)
+            run_get_cache_ready(client)
 
         # ==============================================================
         # print-project-vs-actual  (standalone mode)

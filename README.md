@@ -73,7 +73,7 @@ On launch, the program starts the Client Portal Gateway and asks you to authenti
 | `project-portfolio` | Skip steps 2-3 entirely — load an existing `output/Project_Portfolio.csv` and jump straight to the interactive order loop. |
 | `buy-all` | Skip reconciliation — order the full target quantities from `Project_Portfolio` regardless of existing positions or pending orders on IBKR. |
 | `cancel-all-orders` | Cancel every open order on the account and exit. The positions cache is re-invalidated afterwards so it starts reloading. |
-| `get-cache-ready` | Cancel all orders, invalidate the gateway's positions cache, and record a timestamp. The cache takes ~30 min to fully reload; ordering modes will block until enough time has elapsed. |
+| `get-cache-ready` | Invalidate the gateway's positions cache and record a timestamp. The cache takes ~30 min to fully reload; ordering modes will block until enough time has elapsed. |
 | `print-project-vs-actual` | Load `Project_Portfolio.csv` and current IBKR positions, then output an Excel comparison (`output/Project_VS_Actual.xlsx`) showing target vs actual allocations. |
 | `-all-exchanges` | Operate on **all** exchanges regardless of trading hours. By default, only currently open exchanges are considered when placing or cancelling orders. Has no effect with `noop` or `noop-recalculate`. Compatible with all other arguments. |
 

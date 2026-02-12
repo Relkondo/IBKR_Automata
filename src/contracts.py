@@ -13,7 +13,7 @@ Fallback chain when a ticker is not found:
 import os
 import re
 import time
-from datetime import datetime
+
 
 import pandas as pd
 
@@ -416,7 +416,8 @@ def _resolve_option_conid(client: IBKRClient, ticker: str,
 
     underlying = m.group("underlying")
     month_num = m.group("month")
-    right = m.group("right")  # "C" or "P"
+    year_short = m.group("year")    # 2-digit year from the ticker (e.g. "26")
+    right = m.group("right")        # "C" or "P"
     strike = float(m.group("strike"))
 
     # For options we use ticker-first logic (names are not useful here).
@@ -448,10 +449,9 @@ def _resolve_option_conid(client: IBKRClient, ticker: str,
 
     underlying_conid, _, _, _ = underlying_result
 
-    # Build the month string IBKR expects (e.g. "MAR26").
+    # Build the month string IBKR expects (e.g. "FEB26").
     month_str = MONTH_MAP.get(month_num, month_num)
-    current_year_short = str(datetime.now().year)[-2:]
-    ibkr_month = f"{month_str}{current_year_short}"
+    ibkr_month = f"{month_str}{year_short}"
 
     # Step 2 – query option info.
     try:
@@ -474,8 +474,46 @@ def _resolve_option_conid(client: IBKRClient, ticker: str,
         )
         return None
 
-    # Take the first matching contract.
-    first = results[0] if isinstance(results[0], dict) else {}
+    # Build the target maturity date string (YYYYMMDD) for exact-day
+    # matching.  The ticker encodes MM/DD/YY so we can reconstruct it.
+    target_maturity = f"20{year_short}{month_num}{m.group('day')}"
+
+    # Filter results to the exact expiration day if possible.
+    # The API may return multiple expiries within the same month
+    # (e.g. weeklies).  Each result typically has a ``maturityDate``
+    # field in YYYYMMDD format.
+    day_matches = [
+        r for r in results
+        if isinstance(r, dict) and str(r.get("maturityDate", "")) == target_maturity
+    ]
+    if day_matches:
+        first = day_matches[0]
+    else:
+        # No exact date match — pick the result with the closest
+        # maturity date to our target.
+        target_int = int(target_maturity)
+        closest = None
+        closest_diff = None
+        for r in results:
+            if not isinstance(r, dict):
+                continue
+            mat = r.get("maturityDate")
+            if mat is None:
+                continue
+            try:
+                diff = abs(int(str(mat)) - target_int)
+            except (ValueError, TypeError):
+                continue
+            if closest_diff is None or diff < closest_diff:
+                closest = r
+                closest_diff = diff
+        first = closest if closest is not None else (
+            results[0] if isinstance(results[0], dict) else {}
+        )
+        chosen_mat = first.get("maturityDate", "?")
+        print(f"  [~] No exact maturity match for {target_maturity}; "
+              f"using closest: {chosen_mat}.")
+
     conid = first.get("conid")
     # Capture the option's description and symbol from the API response.
     api_name = first.get("desc2") or first.get("desc1")

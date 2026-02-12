@@ -91,6 +91,13 @@ def cancel_all_orders(client: IBKRClient,
     cancelled = 0
     failed = 0
     skipped = 0
+
+    # Per-exchange consent tracking.
+    cancel_confirm_all: bool = False
+    cancel_skip_all: bool = False
+    cancel_confirm_exchanges: set[str] = set()
+    cancel_skip_exchanges: set[str] = set()
+
     for o in active:
         oid = str(o.get("orderId") or o.get("order_id"))
         ticker = o.get("ticker") or o.get("symbol") or ""
@@ -98,20 +105,70 @@ def cancel_all_orders(client: IBKRClient,
         remaining = o.get("remainingQuantity") or o.get("remaining_quantity") or ""
         price = o.get("price", "")
 
-        # Exchange filtering when not using -all-exchanges.
-        if not all_exchanges:
-            raw_exchange = o.get("exchange") or o.get("listingExchange") or ""
-            if raw_exchange:
-                mic = exchange_to_mic(str(raw_exchange))
-                if not is_exchange_open(mic):
-                    print(f"  Skipped order {oid}  {side} {remaining} {ticker} @ {price}"
-                          f"  (exchange {mic} closed)")
-                    skipped += 1
-                    continue
+        # Determine the MIC for this order.
+        raw_exchange = o.get("exchange") or o.get("listingExchange") or ""
+        mic = exchange_to_mic(str(raw_exchange)) if raw_exchange else ""
 
+        # Exchange filtering when not using -all-exchanges.
+        if not all_exchanges and mic:
+            if not is_exchange_open(mic):
+                print(f"  Skipped order {oid}  {side} {remaining} {ticker} @ {price}"
+                      f"  (exchange {mic} closed)")
+                skipped += 1
+                continue
+
+        # --- Per-exchange auto-skip check ---
+        if cancel_skip_all or mic in cancel_skip_exchanges:
+            print(f"  Skipped order {oid}  {side} {remaining} {ticker} @ {price}"
+                  f"  (auto-skip)")
+            skipped += 1
+            continue
+
+        # --- Per-exchange auto-confirm check ---
+        if cancel_confirm_all or mic in cancel_confirm_exchanges:
+            auto = True
+        else:
+            auto = False
+
+        if not auto:
+            mic_label = mic or "?"
+            print(f"\n  Order {oid}  {side} {remaining} {ticker} @ {price}"
+                  f"  (exchange: {mic_label})")
+            choice = input(
+                f"  [Y] Cancel  [A] Cancel All  "
+                f"[E] Cancel All {mic_label}  "
+                f"[S] Skip  [X] Skip All {mic_label}  "
+                f"[N] Skip All  > "
+            ).strip().upper()
+
+            if choice == "A":
+                cancel_confirm_all = True
+            elif choice == "E":
+                cancel_confirm_exchanges.add(mic)
+            elif choice == "X":
+                cancel_skip_exchanges.add(mic)
+                print(f"    Skipped.")
+                skipped += 1
+                continue
+            elif choice == "N":
+                cancel_skip_all = True
+                print(f"    Skipped.")
+                skipped += 1
+                continue
+            elif choice == "S":
+                print(f"    Skipped.")
+                skipped += 1
+                continue
+            elif choice != "Y":
+                print(f"    Invalid choice, skipping.")
+                skipped += 1
+                continue
+
+        # Proceed with cancellation.
         try:
             client.cancel_order(account_id, oid)
-            print(f"  Cancelled order {oid}  {side} {remaining} {ticker} @ {price}")
+            auto_tag = " (auto)" if auto else ""
+            print(f"  Cancelled order {oid}  {side} {remaining} {ticker} @ {price}{auto_tag}")
             cancelled += 1
             time.sleep(0.2)
         except Exception as exc:
@@ -120,7 +177,7 @@ def cancel_all_orders(client: IBKRClient,
 
     parts = [f"{cancelled} cancelled", f"{failed} failed"]
     if skipped:
-        parts.append(f"{skipped} skipped (exchange closed)")
+        parts.append(f"{skipped} skipped")
     print(f"\nDone: {', '.join(parts)}.\n")
 
 
@@ -224,6 +281,8 @@ def run_order_loop(client: IBKRClient, df: pd.DataFrame) -> list[dict]:
     account_id = get_account_id(client)
     placed_orders: list[dict] = []
     confirm_all = False
+    auto_confirm_exchanges: set[str] = set()
+    auto_skip_exchanges: set[str] = set()
     total = len(df)
 
     for idx, row in df.iterrows():
@@ -294,10 +353,20 @@ def run_order_loop(client: IBKRClient, df: pd.DataFrame) -> list[dict]:
 
         quantity = quantity_initial
 
-        # Currency info for display.
+        # Currency / exchange info for display and consent logic.
         ccy = row.get("currency")
         ccy_label = str(ccy) if pd.notna(ccy) else "USD"
         is_foreign = ccy_label != "USD"
+        mic_raw = row.get("MIC Primary Exchange")
+        mic_str = str(mic_raw).strip().upper() if pd.notna(mic_raw) else ""
+
+        # --- Per-exchange auto-skip check ---
+        if mic_str in auto_skip_exchanges:
+            print(
+                f"\n[{idx + 1}/{total}] {name} ({ticker}) -- "
+                f"auto-skipped ({mic_str})"
+            )
+            continue
 
         # --- Prompt loop ---
         while True:
@@ -305,6 +374,7 @@ def run_order_loop(client: IBKRClient, df: pd.DataFrame) -> list[dict]:
             details = (
                 f"\n[{idx + 1}/{total}] {name} ({ticker})\n"
                 f"  Side              : {side}\n"
+                f"  Exchange          : {mic_str or '?'}\n"
                 f"  Currency          : {ccy_label}\n"
                 f"  Limit Price       : {limit_price:,.2f} {ccy_label}\n"
                 f"  Quantity          : {quantity}\n"
@@ -332,18 +402,23 @@ def run_order_loop(client: IBKRClient, df: pd.DataFrame) -> list[dict]:
                 )
             print(details)
 
-            if confirm_all:
+            if confirm_all or mic_str in auto_confirm_exchanges:
                 choice = "Y"
                 print("  (auto-confirmed)")
             else:
+                mic_label = mic_str or "?"
                 choice = input(
-                    "  [Y] Confirm  [A] Confirm All  [M] Modify  "
-                    "[S] Skip  [Q] Quit  > "
+                    f"  [Y] Confirm  [A] Confirm All  "
+                    f"[E] Confirm All {mic_label}  [M] Modify\n"
+                    f"  [S] Skip  [X] Skip All {mic_label}  "
+                    f"[Q] Quit  > "
                 ).strip().upper()
 
-            if choice in ("Y", "A"):
+            if choice in ("Y", "A", "E"):
                 if choice == "A":
                     confirm_all = True
+                elif choice == "E":
+                    auto_confirm_exchanges.add(mic_str)
                 order_ticket = {
                     "conid": conid,
                     "side": side,
@@ -457,6 +532,11 @@ def run_order_loop(client: IBKRClient, df: pd.DataFrame) -> list[dict]:
                 # Loop back to show updated values.
                 continue
 
+            elif choice == "X":
+                auto_skip_exchanges.add(mic_str)
+                print(f"    Skipped (+ auto-skip all {mic_str}).")
+                break
+
             elif choice == "S":
                 print("    Skipped.")
                 break
@@ -466,7 +546,7 @@ def run_order_loop(client: IBKRClient, df: pd.DataFrame) -> list[dict]:
                 return placed_orders
 
             else:
-                print("    Invalid choice. Please enter Y, A, M, S, or Q.")
+                print("    Invalid choice. Please enter Y, A, E, M, S, X, or Q.")
 
     return placed_orders
 

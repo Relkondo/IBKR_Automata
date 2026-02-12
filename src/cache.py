@@ -23,14 +23,14 @@ from datetime import datetime, timezone
 
 from src.api_client import IBKRClient
 from src.config import ASSETS_DIR
-from src.orders import cancel_all_orders, get_account_id
+from src.orders import get_account_id
 
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 
 CACHE_READY_FILE = os.path.join(ASSETS_DIR, ".cache_ready")
-CACHE_READY_WAIT_MINUTES = 3
+CACHE_READY_WAIT_MINUTES = 10
 
 
 # ---------------------------------------------------------------------------
@@ -115,18 +115,12 @@ def check_cache_ready() -> tuple[bool, str]:
     return (True, "")
 
 
-def run_get_cache_ready(client: IBKRClient,
-                        all_exchanges: bool = True) -> None:
+def run_get_cache_ready(client: IBKRClient) -> None:
     """Full cache-preparation flow.
 
-    1. Cancel all open orders (respecting ``-all-exchanges``).
-    2. Invalidate the positions cache and prime for refill.
-    3. Record the invalidation timestamp.
+    1. Invalidate the positions cache and prime for refill.
+    2. Record the invalidation timestamp.
     """
-    # 1. Cancel orders.
-    cancel_all_orders(client, all_exchanges=all_exchanges)
-
-    # 2 & 3. Invalidate + prime + record.
     account_id = get_account_id(client)
     invalidate_and_record(client, account_id)
 
