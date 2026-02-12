@@ -108,7 +108,7 @@ _IBKR_EXCHANGE_TO_MIC: dict[str, str] = {
 }
 
 
-def _exchange_to_mic(exchange: str) -> str:
+def exchange_to_mic(exchange: str) -> str:
     """Convert an IBKR exchange abbreviation to a MIC code.
 
     Falls back to returning the exchange string itself (uppercased) if
@@ -158,17 +158,17 @@ def _match_exchange(results: list, mic: str | None) -> dict | None:
             for section in sections:
                 if isinstance(section, dict):
                     sec_exc = section.get("exchange", "")
-                    if _exchange_to_mic(sec_exc) == mic_upper:
+                    if exchange_to_mic(sec_exc) == mic_upper:
                         return entry
 
             # Try top-level exchange field.
             top_exc = entry.get("exchange", "")
-            if top_exc and _exchange_to_mic(top_exc) == mic_upper:
+            if top_exc and exchange_to_mic(top_exc) == mic_upper:
                 return entry
 
             # Try extracting from companyHeader.
             header_exc = _extract_header_exchange(entry)
-            if header_exc and _exchange_to_mic(header_exc) == mic_upper:
+            if header_exc and exchange_to_mic(header_exc) == mic_upper:
                 return entry
 
     return dict_results[0]

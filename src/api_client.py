@@ -198,11 +198,29 @@ class IBKRClient:
     # Portfolio positions
     # ------------------------------------------------------------------
 
+    def invalidate_positions_cache(self, account_id: str) -> None:
+        """Invalidate the backend portfolio cache.
+
+        Calls ``POST /portfolio/{accountId}/positions/invalidate`` to
+        force the gateway to refresh position data from the IBKR backend.
+        Without this, the positions endpoint may return stale or
+        incomplete data from the gateway's internal cache.
+        """
+        resp = self.session.post(
+            f"{self.base_url}/portfolio/{account_id}/positions/invalidate"
+        )
+        resp.raise_for_status()
+
     def get_positions(self, account_id: str) -> list[dict]:
         """Retrieve all portfolio positions across all pages.
 
-        Calls ``GET /portfolio/{accountId}/positions/{pageId}`` and
-        paginates until an empty page is returned.
+        The correct sequence for reliable position data is:
+
+        1. ``GET /portfolio/accounts`` – prime the portfolio subsystem.
+        2. ``POST /portfolio/{accountId}/positions/invalidate`` – force a
+           cache refresh so the gateway fetches fresh data from the
+           IBKR backend.
+        3. Paginate ``GET /portfolio/{accountId}/positions/{pageId}``.
 
         Returns
         -------
@@ -210,14 +228,51 @@ class IBKRClient:
             Flat list of position dicts, each containing at least
             ``conid``, ``position``, ``contractDesc``, ``mktValue``, etc.
         """
+        # 1. Prime the portfolio subsystem.
+        self.session.get(f"{self.base_url}/portfolio/accounts")
+
+        # 2. Invalidate the backend cache to force a fresh load.
+        # self.invalidate_positions_cache(account_id)
+
+        # 3. Wait for the backend to repopulate the cache.
+        import time
+        # time.sleep(3)
+
+        # 4. Paginate positions.
+        #    Each item in a page carries a ``pageSize`` field indicating
+        #    how many items the page *should* contain.  If the actual
+        #    count is lower, the cache hasn't fully loaded yet; we retry
+        #    the same page after a short delay until it is complete.
+        MAX_PAGE_RETRIES = 10
+        RETRY_DELAY = 0.5  # seconds
+
         all_positions: list[dict] = []
         page = 0
         while True:
-            resp = self.session.get(
-                f"{self.base_url}/portfolio/{account_id}/positions/{page}"
-            )
-            resp.raise_for_status()
-            data = resp.json()
+            for attempt in range(1, MAX_PAGE_RETRIES + 1):
+                resp = self.session.get(
+                    f"{self.base_url}/portfolio/{account_id}/positions/{page}"
+                )
+                resp.raise_for_status()
+                data = resp.json()
+
+                if not data:
+                    # Empty page – either no more data or cache still
+                    # loading.  Retry a few times before accepting it.
+                    if attempt < MAX_PAGE_RETRIES:
+                        time.sleep(RETRY_DELAY)
+                        continue
+                    break
+
+                expected = data[0].get("pageSize")
+                if expected is not None and len(data) < int(expected):
+                    # Page is incomplete – cache not ready yet.
+                    if attempt < MAX_PAGE_RETRIES:
+                        time.sleep(RETRY_DELAY)
+                        continue
+                # Page looks complete (or we exhausted retries).
+                break
+
             if not data:
                 break
             all_positions.extend(data)

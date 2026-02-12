@@ -20,6 +20,13 @@ CLI arguments
                       straight to the interactive order loop (step 6-7).
   buy-all             Skip reconciliation – order the full Project_Portfolio
                       quantities regardless of existing IBKR positions.
+  cancel-all-orders   Cancel every open order on the account and exit.
+  print-project-vs-actual
+                      Load Project_Portfolio.csv and current IBKR positions,
+                      then output an Excel comparison to output/.
+  -all-exchanges      Operate on all exchanges regardless of trading hours.
+                      By default, only currently open exchanges are used
+                      for placing and cancelling orders.
 """
 
 import os
@@ -33,7 +40,9 @@ from src.gateway import launch_gateway, wait_for_auth, SessionKeepalive
 from src.portfolio import load_portfolio
 from src.contracts import resolve_conids
 from src.market_data import fetch_market_data, resolve_currencies, save_project_portfolio
-from src.orders import run_order_loop, print_order_summary
+from src.comparison import generate_project_vs_actual
+from src.exchange_hours import filter_df_by_open_exchange
+from src.orders import cancel_all_orders, run_order_loop, print_order_summary
 from src.reconcile import reconcile
 
 
@@ -56,25 +65,36 @@ def main() -> None:
     noop_recalc = "noop-recalculate" in args
     use_saved = "project-portfolio" in args
     buy_all = "buy-all" in args
+    cancel_all = "cancel-all-orders" in args
+    print_comparison = "print-project-vs-actual" in args
+    all_exchanges = "-all-exchanges" in args
 
     # Mutual exclusivity checks.
-    mode_flags = sum([noop, noop_recalc, use_saved])
+    mode_flags = sum([noop, noop_recalc, use_saved, cancel_all, print_comparison])
     if mode_flags > 1:
-        print("Error: 'noop', 'noop-recalculate', and 'project-portfolio' "
+        print("Error: 'noop', 'noop-recalculate', 'project-portfolio', "
+              "'cancel-all-orders', and 'print-project-vs-actual' "
               "are mutually exclusive.")
         sys.exit(1)
 
-    if noop:
+    if print_comparison:
+        print("Running in PRINT-PROJECT-VS-ACTUAL mode.\n")
+    elif cancel_all:
+        print("Running in CANCEL-ALL-ORDERS mode.\n")
+    elif noop:
         print("Running in NOOP mode -- orders will NOT be placed.\n")
-    if noop_recalc:
+    elif noop_recalc:
         print("Running in NOOP-RECALCULATE mode -- "
               "re-fetching market data for existing conids.\n")
-    if use_saved:
+    elif use_saved:
         print("Running in PROJECT_PORTFOLIO mode -- "
               "using saved CSV, skipping steps 2-5.\n")
     if buy_all:
         print("Running in BUY-ALL mode -- "
               "skipping reconciliation with existing IBKR positions.\n")
+    if all_exchanges:
+        print("ALL-EXCHANGES mode -- "
+              "operating on all exchanges regardless of trading hours.\n")
 
     # ------------------------------------------------------------------
     # 1. Launch gateway & authenticate
@@ -94,7 +114,11 @@ def main() -> None:
     keepalive.start()
 
     try:
-        if use_saved:
+        if print_comparison:
+            generate_project_vs_actual(client)
+        elif cancel_all:
+            cancel_all_orders(client, all_exchanges=all_exchanges)
+        elif use_saved:
             # Load the previously generated CSV directly.
             df = _load_project_portfolio()
         elif noop_recalc:
@@ -142,13 +166,20 @@ def main() -> None:
             # ----------------------------------------------------------
             save_project_portfolio(df)
 
-        if not noop and not noop_recalc:
+        if not noop and not noop_recalc and not cancel_all and not print_comparison:
             # ----------------------------------------------------------
             # 5b. Reconcile against IBKR state (unless buy-all)
             # ----------------------------------------------------------
             if not buy_all:
                 print("Reconciling target portfolio with IBKR state ...\n")
-                df = reconcile(client, df)
+                df = reconcile(client, df, all_exchanges=all_exchanges)
+
+            # ----------------------------------------------------------
+            # 5c. Filter to open exchanges (unless -all-exchanges)
+            # ----------------------------------------------------------
+            if not all_exchanges:
+                print("Filtering to currently open exchanges ...\n")
+                df = filter_df_by_open_exchange(df)
 
             # ----------------------------------------------------------
             # 6. Interactive order loop
@@ -159,7 +190,7 @@ def main() -> None:
             # 7. Summary
             # ----------------------------------------------------------
             print_order_summary(placed)
-        else:
+        elif noop or noop_recalc:
             print("\nNOOP mode -- skipping order placement. "
                   "Review Project_Portfolio.csv in the output directory."
                   + (" (market data refreshed)" if noop_recalc else ""))

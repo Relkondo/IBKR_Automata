@@ -18,6 +18,7 @@ import time
 import pandas as pd
 
 from src.api_client import IBKRClient
+from src.exchange_hours import is_exchange_open
 from src.orders import get_account_id
 
 
@@ -27,14 +28,18 @@ from src.orders import get_account_id
 
 def _fetch_positions(client: IBKRClient,
                      account_id: str) -> dict[int, float]:
-    """Return a mapping ``{conid: signed_position_qty}``."""
+    """Return a mapping ``{conid: signed_position_qty}``.
+
+    IBKR may return duplicate entries for the same conid across pages;
+    we keep the last entry per conid to avoid double-counting.
+    """
     raw = client.get_positions(account_id)
     positions: dict[int, float] = {}
     for entry in raw:
         cid = entry.get("conid")
         qty = entry.get("position", 0)
         if cid is not None:
-            positions[int(cid)] = positions.get(int(cid), 0) + float(qty)
+            positions[int(cid)] = float(qty)
     return positions
 
 
@@ -91,7 +96,8 @@ def _signed_order_qty(order: dict) -> float:
 
 
 def reconcile(client: IBKRClient,
-              df: pd.DataFrame) -> pd.DataFrame:
+              df: pd.DataFrame,
+              all_exchanges: bool = True) -> pd.DataFrame:
     """Compute net quantities and cancel stale orders.
 
     For each row in *df* that has a valid ``conid`` and ``limit_price``:
@@ -104,6 +110,10 @@ def reconcile(client: IBKRClient,
        correct sign.
     5. ``net_qty = target_qty - existing_qty - pending_qty``.
 
+    When *all_exchanges* is ``False``, stale-order cancellation is
+    skipped for rows whose exchange is currently closed.  The stale
+    orders are counted as pending instead (so they are not lost).
+
     The result DataFrame has new columns:
     ``existing_qty``, ``pending_qty``, ``target_qty``, ``net_quantity``,
     and ``cancelled_orders`` (number of stale orders cancelled for that row).
@@ -115,6 +125,9 @@ def reconcile(client: IBKRClient,
     df : pd.DataFrame
         The Project_Portfolio DataFrame (must have ``conid``,
         ``limit_price``, ``Dollar Allocation`` columns).
+    all_exchanges : bool
+        When ``False``, stale-order cancellation is skipped for rows
+        on exchanges that are currently closed.
 
     Returns
     -------
@@ -198,21 +211,36 @@ def reconcile(client: IBKRClient,
         pending = 0
         cancelled = 0
         conid_orders = orders_by_conid.get(conid, [])
+
+        # Determine whether we can cancel stale orders for this row.
+        mic = row.get("MIC Primary Exchange")
+        can_cancel = all_exchanges
+        if not can_cancel and pd.notna(mic) and str(mic).strip():
+            can_cancel = is_exchange_open(str(mic).strip())
+
         for order in conid_orders:
             order_price = order.get("price")
             if order_price is not None and abs(order_price - limit_price) > PRICE_TOL:
-                # Stale order – different price. Cancel it.
-                try:
-                    client.cancel_order(account_id, order["orderId"])
+                if can_cancel:
+                    # Stale order – different price. Cancel it.
+                    try:
+                        client.cancel_order(account_id, order["orderId"])
+                        name = row.get("Name", "")
+                        print(f"  [{idx + 1}/{total}] Cancelled stale order "
+                              f"{order['orderId']} for '{name}' "
+                              f"(old price={order_price}, new price={limit_price})")
+                        cancelled += 1
+                        time.sleep(0.2)
+                    except Exception as exc:
+                        print(f"  [!] Failed to cancel order {order['orderId']}: {exc}")
+                        # Count it as pending since we couldn't cancel.
+                        pending += _signed_order_qty(order)
+                else:
+                    # Exchange is closed — keep the stale order as pending.
                     name = row.get("Name", "")
-                    print(f"  [{idx + 1}/{total}] Cancelled stale order "
-                          f"{order['orderId']} for '{name}' "
-                          f"(old price={order_price}, new price={limit_price})")
-                    cancelled += 1
-                    time.sleep(0.2)
-                except Exception as exc:
-                    print(f"  [!] Failed to cancel order {order['orderId']}: {exc}")
-                    # Count it as pending since we couldn't cancel.
+                    print(f"  [{idx + 1}/{total}] Stale order "
+                          f"{order['orderId']} for '{name}' kept "
+                          f"(exchange {str(mic).strip()} closed)")
                     pending += _signed_order_qty(order)
             else:
                 # Order at the correct price – count towards pending.

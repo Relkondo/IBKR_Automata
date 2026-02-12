@@ -49,6 +49,82 @@ def get_account_id(client: IBKRClient) -> str:
 
 
 # ------------------------------------------------------------------
+# Cancel all orders
+# ------------------------------------------------------------------
+
+def cancel_all_orders(client: IBKRClient,
+                      all_exchanges: bool = True) -> None:
+    """Fetch every open order and attempt to cancel each one.
+
+    Parameters
+    ----------
+    all_exchanges : bool
+        When ``False``, only cancel orders whose exchange is currently
+        open.  Orders on closed exchanges are skipped with a message.
+    """
+    import time
+
+    from src.contracts import exchange_to_mic
+    from src.exchange_hours import is_exchange_open
+
+    account_id = get_account_id(client)
+
+    print("Fetching open orders ...")
+    orders = client.get_live_orders()
+
+    # Filter to active orders only.
+    active = []
+    for o in orders:
+        status = str(o.get("status", "")).lower()
+        if status in ("cancelled", "filled", "inactive"):
+            continue
+        oid = o.get("orderId") or o.get("order_id")
+        if oid is not None:
+            active.append(o)
+
+    if not active:
+        print("No active orders to cancel.\n")
+        return
+
+    print(f"Found {len(active)} active order(s). Cancelling ...\n")
+
+    cancelled = 0
+    failed = 0
+    skipped = 0
+    for o in active:
+        oid = str(o.get("orderId") or o.get("order_id"))
+        ticker = o.get("ticker") or o.get("symbol") or ""
+        side = o.get("side", "")
+        remaining = o.get("remainingQuantity") or o.get("remaining_quantity") or ""
+        price = o.get("price", "")
+
+        # Exchange filtering when not using -all-exchanges.
+        if not all_exchanges:
+            raw_exchange = o.get("exchange") or o.get("listingExchange") or ""
+            if raw_exchange:
+                mic = exchange_to_mic(str(raw_exchange))
+                if not is_exchange_open(mic):
+                    print(f"  Skipped order {oid}  {side} {remaining} {ticker} @ {price}"
+                          f"  (exchange {mic} closed)")
+                    skipped += 1
+                    continue
+
+        try:
+            client.cancel_order(account_id, oid)
+            print(f"  Cancelled order {oid}  {side} {remaining} {ticker} @ {price}")
+            cancelled += 1
+            time.sleep(0.2)
+        except Exception as exc:
+            print(f"  [!] Failed to cancel order {oid} ({ticker}): {exc}")
+            failed += 1
+
+    parts = [f"{cancelled} cancelled", f"{failed} failed"]
+    if skipped:
+        parts.append(f"{skipped} skipped (exchange closed)")
+    print(f"\nDone: {', '.join(parts)}.\n")
+
+
+# ------------------------------------------------------------------
 # Order helpers
 # ------------------------------------------------------------------
 

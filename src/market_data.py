@@ -498,9 +498,11 @@ def fetch_market_data(client: IBKRClient, df: pd.DataFrame) -> pd.DataFrame:
         return shares if float(da) >= 0 else -shares
 
     df["Qty"] = df.apply(_planned_qty, axis=1)
+    # Preserve the sign of Qty so that Actual Dollar Allocation is
+    # negative for short-sell positions (matching Dollar Allocation sign).
     df["Actual Dollar Allocation"] = df.apply(
         lambda r: round(
-            float(r["limit_price"]) * abs(float(r["Qty"])) / (_get_fx(r) or 1.0),
+            float(r["limit_price"]) * float(r["Qty"]) / (_get_fx(r) or 1.0),
             2,
         )
         if pd.notna(r.get("limit_price")) and pd.notna(r.get("Qty"))
