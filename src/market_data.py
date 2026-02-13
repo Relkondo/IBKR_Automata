@@ -52,6 +52,104 @@ def _safe_float(val) -> float | None:
         return None
 
 
+# ------------------------------------------------------------------
+# Tick-size helpers
+# ------------------------------------------------------------------
+
+# Cache: market_rule_id -> sorted list of (lowEdge, increment)
+_market_rule_cache: dict[int, list[tuple[float, float]]] = {}
+
+
+def _fetch_single_rule(ib: IB, rule_id: int) -> list[tuple[float, float]]:
+    """Fetch and cache a single market rule by ID."""
+    if rule_id in _market_rule_cache:
+        return _market_rule_cache[rule_id]
+
+    try:
+        increments = ib.reqMarketRule(rule_id)
+        if increments:
+            rules = sorted(
+                [(float(pi.lowEdge), float(pi.increment))
+                 for pi in increments],
+                key=lambda x: x[0],
+            )
+        else:
+            rules = []
+    except Exception as exc:
+        print(f"  [!] reqMarketRule({rule_id}) failed: {exc}")
+        rules = []
+
+    _market_rule_cache[rule_id] = rules
+    return rules
+
+
+def _applicable_increment(
+    rules: list[tuple[float, float]], price: float,
+) -> float:
+    """Return the tick increment applicable to *price* from *rules*."""
+    if not rules:
+        return 0.0
+    increment = rules[0][1]
+    for low_edge, inc in rules:
+        if price >= low_edge:
+            increment = inc
+        else:
+            break
+    return increment
+
+
+def _fetch_market_rules(ib: IB, rule_ids_str: str) -> list[tuple[float, float]]:
+    """Fetch and cache price-increment rules (kept for import compat).
+
+    Returns the rules for the first rule ID.  For full tick-size
+    snapping, use ``snap_to_tick`` which checks ALL rule IDs.
+    """
+    if not rule_ids_str:
+        return []
+    first_id = int(rule_ids_str.split(",")[0].strip())
+    return _fetch_single_rule(ib, first_id)
+
+
+def snap_to_tick(
+    price: float,
+    ib: IB,
+    rule_ids_str: str,
+    is_buy: bool = True,
+) -> float:
+    """Snap *price* to the most restrictive valid tick increment.
+
+    Checks **all** market rule IDs in *rule_ids_str* (which correspond
+    to the different exchanges the contract can trade on).  For SMART
+    routing the order must be valid on whichever exchange is selected,
+    so we use the **largest** (most restrictive) tick at the given
+    price level.
+
+    For BUY orders, rounds **down** (conservative — we don't overpay).
+    For SELL orders, rounds **up** (conservative — we don't undersell).
+    """
+    if not rule_ids_str or price <= 0:
+        return price
+
+    # Find the largest applicable tick across all rule sets.
+    max_tick = 0.0
+    for rid_str in rule_ids_str.split(","):
+        rid_str = rid_str.strip()
+        if not rid_str:
+            continue
+        rules = _fetch_single_rule(ib, int(rid_str))
+        tick = _applicable_increment(rules, price)
+        if tick > max_tick:
+            max_tick = tick
+
+    if max_tick <= 0:
+        return price
+
+    if is_buy:
+        return math.floor(price / max_tick) * max_tick
+    else:
+        return math.ceil(price / max_tick) * max_tick
+
+
 def fetch_net_liquidation(ib: IB) -> float:
     """Fetch the account net liquidation value in USD from IBKR.
 
@@ -344,6 +442,29 @@ def fetch_market_data(ib: IB, df: pd.DataFrame) -> pd.DataFrame:
     contracts_list = [cid_to_contract[cid] for cid in all_conids
                       if cid in cid_to_contract]
 
+    # Ensure market_rule_ids column exists (needed for tick-size snapping).
+    # When loading from a saved CSV the column may be absent.
+    needs_rules = (
+        "market_rule_ids" not in df.columns
+        or df.loc[df["conid"].notna(), "market_rule_ids"]
+              .fillna("").astype(str).str.strip().eq("").all()
+    )
+    if needs_rules:
+        print("  Fetching market rules for tick-size snapping …")
+        mrids_map: dict[int, str] = {}
+        for c in contracts_list:
+            try:
+                cds = ib.reqContractDetails(c)
+                if cds:
+                    mrids_map[c.conId] = cds[0].marketRuleIds or ""
+            except Exception:
+                pass
+        df["market_rule_ids"] = df["conid"].apply(
+            lambda cid: mrids_map.get(int(cid), "")
+            if pd.notna(cid) else ""
+        )
+        print(f"  Market rules fetched for {len(mrids_map)} contracts.")
+
     # Fetch snapshots in batches via reqTickers.
     snapshot: dict[int, dict] = {}
     total_batches = math.ceil(len(contracts_list) / SNAPSHOT_BATCH_SIZE)
@@ -383,6 +504,21 @@ def fetch_market_data(ib: IB, df: pd.DataFrame) -> pd.DataFrame:
     df["day_low"] = lows
 
     df["limit_price"] = df.apply(_calc_limit_price, axis=1)
+
+    # Snap limit prices to valid tick increments.
+    def _snap_limit(row):
+        lp = row.get("limit_price")
+        if pd.isna(lp):
+            return None
+        mrids = row.get("market_rule_ids")
+        if pd.isna(mrids) or not str(mrids).strip():
+            return lp
+        da = row.get("Dollar Allocation")
+        is_buy = pd.isna(da) or float(da) >= 0
+        snapped = snap_to_tick(float(lp), ib, str(mrids), is_buy=is_buy)
+        return round(snapped, 10)  # clean floating-point noise
+
+    df["limit_price"] = df.apply(_snap_limit, axis=1)
 
     def _get_fx(r) -> float | None:
         ccy = r.get("currency")

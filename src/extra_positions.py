@@ -18,7 +18,8 @@ from src.config import MINIMUM_TRADING_AMOUNT
 from src.contracts import exchange_to_mic
 from src.exchange_hours import is_exchange_open
 from src.market_data import (
-    _snapshot_batch, _resolve_fx_rate, SNAPSHOT_BATCH_SIZE, FILL_PATIENCE,
+    _snapshot_batch, _resolve_fx_rate, snap_to_tick,
+    SNAPSHOT_BATCH_SIZE, FILL_PATIENCE,
 )
 
 
@@ -96,16 +97,24 @@ def reconcile_extra_positions(
     print(f"\nFound {len(extra_conids)} IBKR position(s) not in the "
           f"input file. Fetching market data to prepare sell orders ...")
 
-    # --- Qualify contracts and extract currencies -----------------------
+    # --- Qualify contracts and extract currencies / market rules ----------
     extra_contracts = [Contract(conId=cid) for cid in extra_conids]
     qualified = ib.qualifyContracts(*extra_contracts)
     cid_to_contract = {c.conId: c for c in qualified if c.conId}
 
     extra_currencies: dict[int, str] = {}
+    extra_market_rules: dict[int, str] = {}
     for cid in extra_conids:
         qc = cid_to_contract.get(cid)
-        if qc and qc.currency:
-            extra_currencies[cid] = qc.currency.upper()
+        if qc:
+            extra_currencies[cid] = (qc.currency or "USD").upper()
+            # Fetch contract details for market rule IDs.
+            try:
+                cds = ib.reqContractDetails(qc)
+                if cds:
+                    extra_market_rules[cid] = cds[0].marketRuleIds or ""
+            except Exception:
+                pass
         else:
             extra_currencies[cid] = "USD"
 
@@ -306,7 +315,18 @@ def reconcile_extra_positions(
         elif ask_val is not None and ask_val > 0:
             limit_price = round(ask_val, 2)
 
+        # Snap limit price to valid tick increment.
+        if limit_price is not None:
+            mrids = extra_market_rules.get(cid, "")
+            if mrids:
+                limit_price = round(
+                    snap_to_tick(limit_price, ib, mrids,
+                                 is_buy=not is_sell),
+                    10,
+                )
+
         row_dict["limit_price"] = limit_price
+        row_dict["market_rule_ids"] = extra_market_rules.get(cid, "")
         row_dict["net_quantity"] = compute_net_quantity(
             target=0, existing=existing, pending=pending,
             limit_price=limit_price, fx_rate=fx,

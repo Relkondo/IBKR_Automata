@@ -6,18 +6,13 @@ printed at the end.
 """
 
 import math
-import re
 
 import pandas as pd
 from ib_async import IB, Contract, LimitOrder, Trade
 
 from src.contracts import exchange_to_mic
 from src.exchange_hours import is_exchange_open
-
-# Regex to detect IBKR's minimum-tick-size rejection.
-_MIN_TICK_RE = re.compile(
-    r"minimum price variation of ([\d.]+)"
-)
+from src.market_data import snap_to_tick
 
 
 # ------------------------------------------------------------------
@@ -157,26 +152,6 @@ def cancel_all_orders(ib: IB,
 
 def _format_currency(value: float) -> str:
     return f"${value:,.2f}"
-
-
-def _snap_to_tick(price: float, tick_size: float, side: str) -> float:
-    """Round *price* to the nearest multiple of *tick_size*.
-
-    At the midpoint, choose the more aggressive side:
-      BUY  -> lower,  SELL -> upper.
-    """
-    lower = round(math.floor(price / tick_size) * tick_size, 10)
-    upper = round(lower + tick_size, 10)
-
-    dist_lower = abs(price - lower)
-    dist_upper = abs(price - upper)
-
-    if abs(dist_lower - dist_upper) < 1e-12:
-        return round(lower if side == "BUY" else upper, 2)
-    elif dist_lower < dist_upper:
-        return round(lower, 2)
-    else:
-        return round(upper, 2)
 
 
 def _place_order(ib: IB, contract: Contract, order: LimitOrder,
@@ -341,48 +316,60 @@ def run_order_loop(ib: IB, df: pd.DataFrame) -> list[dict]:
                     trade = _place_order(ib, order_contract, order)
                     status = trade.orderStatus.status
 
-                    # Check for tick-size errors in the log.
-                    error_text = " ".join(
-                        str(msg) for msg in trade.log if msg
+                    # Check for Error 110 (tick-size rejection).
+                    has_tick_error = any(
+                        getattr(e, "errorCode", 0) == 110
+                        for e in trade.log
                     )
-                    tick_match = _MIN_TICK_RE.search(error_text)
-                    if tick_match:
-                        tick_size = float(tick_match.group(1))
-                        adjusted = _snap_to_tick(
-                            limit_price, tick_size, side)
-                        print(f"    Price {_format_currency(limit_price)} "
-                              f"doesn't conform to tick size {tick_size}. "
-                              f"Retrying at "
-                              f"{_format_currency(adjusted)} ...")
-                        limit_price = adjusted
-                        continue
+                    if has_tick_error:
+                        # Fetch market rules and snap the price.
+                        mrids = row.get("market_rule_ids")
+                        if pd.isna(mrids) or not str(mrids).strip():
+                            # Fetch from contract details on the fly.
+                            try:
+                                cds = ib.reqContractDetails(
+                                    order_contract)
+                                if cds:
+                                    mrids = cds[0].marketRuleIds or ""
+                            except Exception:
+                                mrids = ""
+                        mrids = str(mrids).strip() if mrids else ""
+                        if mrids:
+                            is_buy = side == "BUY"
+                            adjusted = round(
+                                snap_to_tick(limit_price, ib, mrids,
+                                             is_buy=is_buy),
+                                10,
+                            )
+                            if adjusted != limit_price:
+                                print(
+                                    f"    Price "
+                                    f"{_format_currency(limit_price)} "
+                                    f"rejected (tick-size). Retrying at "
+                                    f"{_format_currency(adjusted)} …")
+                                limit_price = adjusted
+                                continue
+                        print(f"    [!] Tick-size error but could not "
+                              f"determine valid tick — skipping.")
+                        break
 
                     order_id = trade.order.orderId
                     print(f"    Order placed -- order_id: {order_id} "
                           f"(status: {status})")
-                    placed_orders.append({
-                        "ticker": ticker,
-                        "name": name,
-                        "conid": conid,
-                        "side": side,
-                        "quantity": quantity,
-                        "limit_price": limit_price,
-                        "order_id": order_id,
-                    })
+                    if status == "Cancelled":
+                        print(f"    [!] Order {order_id} was immediately "
+                              f"cancelled — not counting as placed.")
+                    else:
+                        placed_orders.append({
+                            "ticker": ticker,
+                            "name": name,
+                            "conid": conid,
+                            "side": side,
+                            "quantity": quantity,
+                            "limit_price": limit_price,
+                            "order_id": order_id,
+                        })
                 except Exception as exc:
-                    error_text = str(exc)
-                    tick_match = _MIN_TICK_RE.search(error_text)
-                    if tick_match:
-                        tick_size = float(tick_match.group(1))
-                        adjusted = _snap_to_tick(
-                            limit_price, tick_size, side)
-                        print(f"    Price {_format_currency(limit_price)} "
-                              f"doesn't conform to tick size {tick_size}. "
-                              f"Retrying at "
-                              f"{_format_currency(adjusted)} ...")
-                        limit_price = adjusted
-                        continue
-
                     print(f"    [!] Order failed: {exc}")
                     if confirm_all:
                         print("    Skipping (auto-confirm mode).")
