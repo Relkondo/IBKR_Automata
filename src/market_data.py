@@ -30,7 +30,7 @@ SNAPSHOT_BATCH_SIZE = 50
 # ------------------------------------------------------------------
 # Limit-price tuning
 # ------------------------------------------------------------------
-FILL_PATIENCE = 105  # 0 = cross spread immediately, 100 = sit on bid/ask
+FILL_PATIENCE = 20  # 0 = cross spread immediately, 100 = sit on bid/ask
 
 
 # ------------------------------------------------------------------

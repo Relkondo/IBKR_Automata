@@ -49,7 +49,7 @@ EXCHANGE_HOURS: dict[str, tuple[str, str, str, tuple[int, ...]]] = {
     "XSGO": ("America/Santiago",     "09:30", "16:00", _MON_FRI),
     # ---- Europe -------------------------------------------------------
     "XLON": ("Europe/London",        "08:00", "16:30", _MON_FRI),
-    "XFRA": ("Europe/Berlin",        "08:00", "22:00", _MON_FRI),
+    "XFRA": ("Europe/Berlin",        "08:00", "23:00", _MON_FRI),
     "XETR": ("Europe/Berlin",        "09:00", "17:30", _MON_FRI),
     "XPAR": ("Europe/Paris",         "09:00", "17:30", _MON_FRI),
     "XAMS": ("Europe/Amsterdam",     "09:00", "17:30", _MON_FRI),

@@ -105,15 +105,18 @@ def reconcile_extra_positions(
 
     extra_currencies: dict[int, str] = {}
     extra_market_rules: dict[int, str] = {}
+    extra_long_names: dict[int, str] = {}
     for cid in extra_conids:
         qc = cid_to_contract.get(cid)
         if qc:
             extra_currencies[cid] = (qc.currency or "USD").upper()
-            # Fetch contract details for market rule IDs.
+            # Fetch contract details for market rule IDs and long name.
             try:
                 cds = ib.reqContractDetails(qc)
                 if cds:
                     extra_market_rules[cid] = cds[0].marketRuleIds or ""
+                    if cds[0].longName:
+                        extra_long_names[cid] = cds[0].longName
             except Exception:
                 pass
         else:
@@ -161,7 +164,7 @@ def reconcile_extra_positions(
     for cid in extra_conids:
         conid_orders = orders_by_conid.get(cid, [])
         pm = position_meta.get(cid, {})
-        pos_name = pm.get("name", str(cid))
+        pos_name = extra_long_names.get(cid, pm.get("ticker", str(cid)))
         raw_exchange = pm.get("exchange", "")
         mic_code = exchange_to_mic(raw_exchange) if raw_exchange else ""
 
@@ -271,11 +274,12 @@ def reconcile_extra_positions(
         high_val = snap.get("high")
         low_val = snap.get("low")
 
+        long_name = extra_long_names.get(cid, pm.get("ticker", str(cid)))
         row_dict: dict = {
             "conid": float(cid),
-            "Name": pm.get("name", str(cid)),
+            "Name": long_name,
             "clean_ticker": pm.get("ticker", str(cid)),
-            "IBKR Name": pm.get("name", str(cid)),
+            "IBKR Name": long_name,
             "IBKR Ticker": pm.get("ticker", str(cid)),
             "MIC Primary Exchange": mic_code,
             "currency": ccy,
