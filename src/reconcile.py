@@ -15,6 +15,7 @@ from __future__ import annotations
 import pandas as pd
 from ib_async import IB, Trade
 
+from src.connection import suppress_errors
 from src.exchange_hours import is_exchange_open
 from src.extra_positions import compute_net_quantity, reconcile_extra_positions
 from src.orders import get_account_id
@@ -293,9 +294,10 @@ def _cancel_stale_orders(
                 # Cancel the stale order via ib_async.
                 try:
                     trade_obj = order.get("trade")
-                    if trade_obj:
-                        ib.cancelOrder(trade_obj.order)
-                    ib.sleep(0.3)
+                    with suppress_errors(202):
+                        if trade_obj:
+                            ib.cancelOrder(trade_obj.order)
+                        ib.sleep(0.3)
                     auto_tag = " (auto)" if auto else ""
                     print(f"  [{idx + 1}/{total}] Cancelled stale order "
                           f"{order['orderId']} for '{name}' "

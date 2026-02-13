@@ -15,6 +15,7 @@ import pandas as pd
 from ib_async import IB, Contract
 
 from src.config import MINIMUM_TRADING_AMOUNT
+from src.connection import suppress_errors
 from src.contracts import exchange_to_mic
 from src.exchange_hours import is_exchange_open
 from src.market_data import (
@@ -233,9 +234,10 @@ def reconcile_extra_positions(
 
             try:
                 trade_obj = order.get("trade")
-                if trade_obj:
-                    ib.cancelOrder(trade_obj.order)
-                ib.sleep(0.3)
+                with suppress_errors(202):
+                    if trade_obj:
+                        ib.cancelOrder(trade_obj.order)
+                    ib.sleep(0.3)
                 auto_tag = " (auto)" if auto else ""
                 print(f"  Cancelled extra-position order "
                       f"{order['orderId']} for '{pos_name}'{auto_tag}")

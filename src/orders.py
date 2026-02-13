@@ -5,15 +5,28 @@ modify, skip, or quit.  Placed orders are tracked and a summary is
 printed at the end.
 """
 
+from __future__ import annotations
+
 import math
+from dataclasses import dataclass, field
 
 import pandas as pd
 from ib_async import IB, Contract, LimitOrder, Trade
 
 from src.config import MAXIMUM_AMOUNT_AUTOMATIC_ORDER
+from src.connection import suppress_errors
 from src.contracts import exchange_to_mic
 from src.exchange_hours import is_exchange_open
 from src.market_data import snap_to_tick
+
+
+@dataclass
+class _AutoState:
+    """Mutable state for auto-confirm / auto-skip across the order loop."""
+
+    confirm_all: bool = False
+    confirm_exchanges: set[str] = field(default_factory=set)
+    skip_exchanges: set[str] = field(default_factory=set)
 
 
 # ------------------------------------------------------------------
@@ -131,8 +144,9 @@ def cancel_all_orders(ib: IB,
 
         # Proceed with cancellation.
         try:
-            ib.cancelOrder(o)
-            ib.sleep(0.3)
+            with suppress_errors(202):
+                ib.cancelOrder(o)
+                ib.sleep(0.3)
             auto_tag = " (auto)" if auto else ""
             print(f"  Cancelled order {oid}  {side} {remaining} "
                   f"{ticker} @ {price}{auto_tag}")
@@ -196,9 +210,7 @@ def _place_single_order(
     mic_str: str,
     placed_orders: list[dict],
     allow_auto: bool,
-    confirm_all: bool,
-    auto_confirm_exchanges: set[str],
-    auto_skip_exchanges: set[str],
+    state: _AutoState,
     deferred_orders: list[dict] | None,
 ) -> str:
     """Run the prompt-loop for one order.
@@ -206,8 +218,7 @@ def _place_single_order(
     Returns a control signal:
       "next"  – move to the next row
       "quit"  – abort the whole loop
-    Side-effects: mutates *placed_orders*, *confirm_all*,
-    *auto_confirm_exchanges*, *auto_skip_exchanges*.
+    Side-effects: mutates *placed_orders* and *state*.
     """
     while True:
         local_amount = round(limit_price * quantity * multiplier, 2)
@@ -245,7 +256,7 @@ def _place_single_order(
         print(details_str)
 
         is_auto = allow_auto and (
-            confirm_all or mic_str in auto_confirm_exchanges
+            state.confirm_all or mic_str in state.confirm_exchanges
         )
         if is_auto:
             # Guardrail: defer large orders for explicit approval.
@@ -290,9 +301,9 @@ def _place_single_order(
 
         if choice in ("Y", "A", "E"):
             if choice == "A":
-                confirm_all = True
+                state.confirm_all = True
             elif choice == "E":
-                auto_confirm_exchanges.add(mic_str)
+                state.confirm_exchanges.add(mic_str)
 
             order = LimitOrder(side, quantity, limit_price)
             order.tif = "DAY"
@@ -394,7 +405,7 @@ def _place_single_order(
             continue
 
         elif choice == "X":
-            auto_skip_exchanges.add(mic_str)
+            state.skip_exchanges.add(mic_str)
             print(f"    Skipped (+ auto-skip all {mic_str}).")
             break
 
@@ -421,9 +432,7 @@ def run_order_loop(ib: IB, df: pd.DataFrame) -> list[dict]:
     account_id = get_account_id(ib)
     placed_orders: list[dict] = []
     deferred_orders: list[dict] = []
-    confirm_all = False
-    auto_confirm_exchanges: set[str] = set()
-    auto_skip_exchanges: set[str] = set()
+    state = _AutoState()
     total = len(df)
 
     for idx, row in df.iterrows():
@@ -470,6 +479,10 @@ def run_order_loop(ib: IB, df: pd.DataFrame) -> list[dict]:
 
         # Determine side and quantity.
         net_qty_raw = row.get("net_quantity")
+        if limit_price <= 0:
+            print(f"[{idx + 1}/{total}] Skipping '{name}' ({ticker}) -- "
+                  f"invalid limit price {limit_price}.")
+            continue
         if pd.notna(net_qty_raw):
             net_qty = int(net_qty_raw)
             if net_qty == 0:
@@ -477,16 +490,18 @@ def run_order_loop(ib: IB, df: pd.DataFrame) -> list[dict]:
                       "already on target, nothing to order.")
                 continue
             side = "SELL" if net_qty < 0 else "BUY"
-            quantity_initial = abs(net_qty)
+            quantity = abs(net_qty)
         else:
             side = "SELL" if dollar_alloc < 0 else "BUY"
             local_alloc = abs(dollar_alloc) * fx
-            quantity_initial = (
+            quantity = (
                 math.floor(local_alloc / (limit_price * multiplier))
                 if limit_price > 0 else 0
             )
-
-        quantity = quantity_initial
+            if quantity <= 0:
+                print(f"[{idx + 1}/{total}] Skipping '{name}' ({ticker}) -- "
+                      "computed quantity is 0.")
+                continue
 
         ccy_label = str(ccy) if pd.notna(ccy) else "USD"
         is_foreign = ccy_label != "USD"
@@ -494,7 +509,7 @@ def run_order_loop(ib: IB, df: pd.DataFrame) -> list[dict]:
         mic_str = str(mic_raw).strip().upper() if pd.notna(mic_raw) else ""
 
         # Auto-skip by exchange.
-        if mic_str in auto_skip_exchanges:
+        if mic_str in state.skip_exchanges:
             print(f"\n[{idx + 1}/{total}] {name} ({ticker}) -- "
                   f"auto-skipped ({mic_str})")
             continue
@@ -526,9 +541,7 @@ def run_order_loop(ib: IB, df: pd.DataFrame) -> list[dict]:
             mic_str=mic_str,
             placed_orders=placed_orders,
             allow_auto=True,
-            confirm_all=confirm_all,
-            auto_confirm_exchanges=auto_confirm_exchanges,
-            auto_skip_exchanges=auto_skip_exchanges,
+            state=state,
             deferred_orders=deferred_orders,
         )
         if signal == "quit":
@@ -564,9 +577,7 @@ def run_order_loop(ib: IB, df: pd.DataFrame) -> list[dict]:
                 mic_str=d["mic_str"],
                 placed_orders=placed_orders,
                 allow_auto=False,  # force manual prompt
-                confirm_all=False,
-                auto_confirm_exchanges=set(),
-                auto_skip_exchanges=set(),
+                state=_AutoState(),
                 deferred_orders=None,  # no re-deferral
             )
             if signal == "quit":
