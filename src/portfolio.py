@@ -61,18 +61,18 @@ def _is_option(row: pd.Series) -> bool:
     return False
 
 
-def _effective_ticker(row: pd.Series) -> str:
-    """Return the security ticker if present, else the ticker."""
+def _clean_ticker(row: pd.Series) -> str:
+    """Pick the best ticker for a row and strip Bloomberg-style suffixes.
+
+    Prefers ``Security Ticker`` when present, falls back to ``Ticker``.
+    Strips trailing country + asset-class tags
+    (e.g. ``'NVDA US Equity'`` → ``'NVDA'``).
+    """
     sec = row.get("Security Ticker")
-    if pd.notna(sec) and str(sec).strip():
-        return str(sec).strip()
-    return str(row.get("Ticker", "")).strip()
-
-
-def _clean_ticker(ticker: str) -> str:
-    """Strip Bloomberg-style suffixes (e.g. 'NVDA US Equity' -> 'NVDA')."""
+    raw = str(sec).strip() if pd.notna(sec) and str(sec).strip() else \
+        str(row.get("Ticker", "")).strip()
     return re.sub(
-        r"\s+[A-Z]{2}\s+(?:Equity|Index)$", "", ticker.strip(),
+        r"\s+[A-Z]{2}\s+(?:Equity|Index)$", "", raw,
         flags=re.IGNORECASE,
     ).strip()
 
@@ -101,10 +101,10 @@ def load_portfolio(xlsx_path: str | None = None) -> pd.DataFrame:
     available = [c for c in _REQUIRED_COLUMNS if c in df.columns]
     df = df[available].copy()
 
-    # Filter: drop rows with empty Name (summary / header rows).
-    df = df[df["Name"].notna() & (df["Name"].astype(str).str.strip() != "")]
-    # Also filter the literal dash used as a placeholder for Cash.
-    df = df[df["Name"].astype(str).str.strip() != "-"]
+    # Filter: drop rows with empty Name (summary / header rows)
+    # and the literal dash used as a placeholder for Cash.
+    name_str = df["Name"].astype(str).str.strip()
+    df = df[df["Name"].notna() & (name_str != "") & (name_str != "-")]
 
     # Ensure Basket Allocation is numeric (percentage of total).
     df["Basket Allocation"] = pd.to_numeric(
@@ -113,9 +113,7 @@ def load_portfolio(xlsx_path: str | None = None) -> pd.DataFrame:
 
     # Derived columns.
     df["is_option"] = df.apply(_is_option, axis=1)
-    df["clean_ticker"] = df.apply(
-        lambda row: _clean_ticker(_effective_ticker(row)), axis=1,
-    )
+    df["clean_ticker"] = df.apply(_clean_ticker, axis=1)
 
     df.reset_index(drop=True, inplace=True)
     print(f"Loaded {len(df)} positions ({df['is_option'].sum()} options).")

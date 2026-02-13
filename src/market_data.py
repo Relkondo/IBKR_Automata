@@ -22,15 +22,10 @@ from ib_async import IB, Contract, Forex
 
 from src.config import FILL_PATIENCE, OUTPUT_DIR, PROJECT_PORTFOLIO_COLUMNS
 
-# ------------------------------------------------------------------
-# Snapshot batching
-# ------------------------------------------------------------------
-SNAPSHOT_BATCH_SIZE = 50
 
-
-# ------------------------------------------------------------------
+# ==================================================================
 # Helpers
-# ------------------------------------------------------------------
+# ==================================================================
 
 def _safe_float(val) -> float | None:
     """Return *val* as a positive float, or None.
@@ -49,114 +44,11 @@ def _safe_float(val) -> float | None:
         return None
 
 
-# ------------------------------------------------------------------
-# Tick-size helpers
-# ------------------------------------------------------------------
+# ==================================================================
+# Market-data snapshots
+# ==================================================================
 
-# Cache: market_rule_id -> sorted list of (lowEdge, increment)
-_market_rule_cache: dict[int, list[tuple[float, float]]] = {}
-
-
-def _fetch_single_rule(ib: IB, rule_id: int) -> list[tuple[float, float]]:
-    """Fetch and cache a single market rule by ID."""
-    if rule_id in _market_rule_cache:
-        return _market_rule_cache[rule_id]
-
-    try:
-        increments = ib.reqMarketRule(rule_id)
-        if increments:
-            rules = sorted(
-                [(float(pi.lowEdge), float(pi.increment))
-                 for pi in increments],
-                key=lambda x: x[0],
-            )
-        else:
-            rules = []
-    except Exception as exc:
-        print(f"  [!] reqMarketRule({rule_id}) failed: {exc}")
-        rules = []
-
-    _market_rule_cache[rule_id] = rules
-    return rules
-
-
-def _applicable_increment(
-    rules: list[tuple[float, float]], price: float,
-) -> float:
-    """Return the tick increment applicable to *price* from *rules*."""
-    if not rules:
-        return 0.0
-    increment = rules[0][1]
-    for low_edge, inc in rules:
-        if price >= low_edge:
-            increment = inc
-        else:
-            break
-    return increment
-
-
-
-def snap_to_tick(
-    price: float,
-    ib: IB,
-    rule_ids_str: str,
-    is_buy: bool = True,
-) -> float:
-    """Snap *price* to the most restrictive valid tick increment.
-
-    Checks **all** market rule IDs in *rule_ids_str* (which correspond
-    to the different exchanges the contract can trade on).  For SMART
-    routing the order must be valid on whichever exchange is selected,
-    so we use the **largest** (most restrictive) tick at the given
-    price level.
-
-    For BUY orders, rounds **down** (conservative — we don't overpay).
-    For SELL orders, rounds **up** (conservative — we don't undersell).
-    """
-    if not rule_ids_str or price <= 0:
-        return price
-
-    # Find the largest applicable tick across all rule sets.
-    max_tick = 0.0
-    for rid_str in rule_ids_str.split(","):
-        rid_str = rid_str.strip()
-        if not rid_str:
-            continue
-        rules = _fetch_single_rule(ib, int(rid_str))
-        tick = _applicable_increment(rules, price)
-        if tick > max_tick:
-            max_tick = tick
-
-    if max_tick <= 0:
-        return price
-
-    if is_buy:
-        return math.floor(price / max_tick) * max_tick
-    else:
-        return math.ceil(price / max_tick) * max_tick
-
-
-def fetch_net_liquidation(ib: IB) -> float:
-    """Fetch the account net liquidation value in USD from IBKR.
-
-    Uses ``ib.accountSummary()`` and looks for the ``NetLiquidation``
-    tag with ``USD`` currency.
-
-    Raises
-    ------
-    RuntimeError
-        If the net liquidation value cannot be found.
-    """
-    summary = ib.accountSummary()
-    for item in summary:
-        if item.tag == "NetLiquidation" and item.currency == "USD":
-            val = float(item.value)
-            if val > 0:
-                return val
-    raise RuntimeError(
-        "Could not retrieve NetLiquidation (USD) from account summary. "
-        "Make sure TWS is connected and has account data loaded."
-    )
+SNAPSHOT_BATCH_SIZE = 50
 
 
 def _snapshot_batch(
@@ -207,9 +99,146 @@ def _snapshot_batch(
     return result
 
 
-# ------------------------------------------------------------------
+# ==================================================================
+# Tick-size snapping
+# ==================================================================
+
+# Cache: market_rule_id -> sorted list of (lowEdge, increment)
+_market_rule_cache: dict[int, list[tuple[float, float]]] = {}
+
+
+def _fetch_single_rule(ib: IB, rule_id: int) -> list[tuple[float, float]]:
+    """Fetch and cache a single market rule by ID."""
+    if rule_id in _market_rule_cache:
+        return _market_rule_cache[rule_id]
+
+    try:
+        increments = ib.reqMarketRule(rule_id)
+        if increments:
+            rules = sorted(
+                [(float(pi.lowEdge), float(pi.increment))
+                 for pi in increments],
+                key=lambda x: x[0],
+            )
+        else:
+            rules = []
+    except Exception as exc:
+        print(f"  [!] reqMarketRule({rule_id}) failed: {exc}")
+        rules = []
+
+    _market_rule_cache[rule_id] = rules
+    return rules
+
+
+def _applicable_increment(
+    rules: list[tuple[float, float]], price: float,
+) -> float:
+    """Return the tick increment applicable to *price* from *rules*."""
+    if not rules:
+        return 0.0
+    increment = rules[0][1]
+    for low_edge, inc in rules:
+        if price >= low_edge:
+            increment = inc
+        else:
+            break
+    return increment
+
+
+def snap_to_tick(
+    price: float,
+    ib: IB,
+    rule_ids_str: str,
+    is_buy: bool = True,
+) -> float:
+    """Snap *price* to the most restrictive valid tick increment.
+
+    Checks **all** market rule IDs in *rule_ids_str* (which correspond
+    to the different exchanges the contract can trade on).  For SMART
+    routing the order must be valid on whichever exchange is selected,
+    so we use the **largest** (most restrictive) tick at the given
+    price level.
+
+    For BUY orders, rounds **down** (conservative — we don't overpay).
+    For SELL orders, rounds **up** (conservative — we don't undersell).
+    """
+    if not rule_ids_str or price <= 0:
+        return price
+
+    # Find the largest applicable tick across all rule sets.
+    max_tick = 0.0
+    for rid_str in rule_ids_str.split(","):
+        rid_str = rid_str.strip()
+        if not rid_str:
+            continue
+        rules = _fetch_single_rule(ib, int(rid_str))
+        tick = _applicable_increment(rules, price)
+        if tick > max_tick:
+            max_tick = tick
+
+    if max_tick <= 0:
+        return price
+
+    if is_buy:
+        return math.floor(price / max_tick) * max_tick
+    else:
+        return math.ceil(price / max_tick) * max_tick
+
+
+def _ensure_market_rules(
+    ib: IB, df: pd.DataFrame, contracts: list[Contract],
+) -> pd.DataFrame:
+    """Populate the ``market_rule_ids`` column if absent or empty.
+
+    Fetches contract details for each contract to obtain the
+    market rule IDs needed for tick-size snapping.
+    """
+    has_rules = (
+        "market_rule_ids" in df.columns
+        and not df.loc[df["conid"].notna(), "market_rule_ids"]
+                  .fillna("").astype(str).str.strip().eq("").all()
+    )
+    if has_rules:
+        return df
+
+    print("  Fetching market rules for tick-size snapping …")
+    mrids_map: dict[int, str] = {}
+    for c in contracts:
+        try:
+            cds = ib.reqContractDetails(c)
+            if cds:
+                raw = cds[0].marketRuleIds or ""
+                mrids_map[c.conId] = ",".join(
+                    dict.fromkeys(r.strip() for r in raw.split(",")
+                                  if r.strip())
+                )
+        except Exception:
+            pass
+    df["market_rule_ids"] = df["conid"].apply(
+        lambda cid: mrids_map.get(int(cid), "")
+        if pd.notna(cid) else ""
+    )
+    print(f"  Market rules fetched for {len(mrids_map)} contracts.")
+    return df
+
+
+def _snap_limit_price(row, ib: IB) -> float | None:
+    """Snap a row's limit price to a valid tick increment."""
+    lp = row.get("limit_price")
+    if pd.isna(lp):
+        return None
+    mrids = row.get("market_rule_ids")
+    if pd.isna(mrids) or not str(mrids).strip():
+        return lp
+    da = row.get("Dollar Allocation")
+    is_buy = pd.isna(da) or float(da) >= 0
+    snapped = snap_to_tick(float(lp), ib, str(mrids), is_buy=is_buy)
+    return round(snapped, 10)  # clean floating-point noise
+
+
+# ==================================================================
 # Limit-price calculation
-# ------------------------------------------------------------------
+# ==================================================================
 
 def _calc_limit_price(row, *, is_sell: bool | None = None) -> float | None:
     """Compute the limit price for a single row.
@@ -271,10 +300,57 @@ def _calc_limit_price(row, *, is_sell: bool | None = None) -> float | None:
     return None
 
 
-# ------------------------------------------------------------------
-# Currency resolution
-# ------------------------------------------------------------------
+# ==================================================================
+# Quantity & allocation helpers
+# ==================================================================
 
+def _get_fx(row) -> float | None:
+    """Return the FX rate for a row: 1.0 for USD, the rate for foreign, None if missing."""
+    ccy = row.get("currency")
+    fx = row.get("fx_rate")
+    if pd.isna(ccy) or str(ccy).upper() == "USD":
+        return 1.0
+    if pd.notna(fx) and float(fx) > 0:
+        return float(fx)
+    return None
+
+
+def _multiplier(row) -> int:
+    """Return 100 for options, 1 for stocks."""
+    return 100 if row.get("is_option") else 1
+
+
+def _planned_qty(row) -> int | None:
+    """Compute the planned share count from limit price and dollar allocation."""
+    lp = row.get("limit_price")
+    da = row.get("Dollar Allocation")
+    if pd.isna(lp) or pd.isna(da) or float(lp) <= 0:
+        return None
+    fx = _get_fx(row)
+    if fx is None:
+        return None
+    local_alloc = abs(float(da)) * fx
+    mult = _multiplier(row)
+    shares = round(local_alloc / (float(lp) * mult))
+    return shares if float(da) >= 0 else -shares
+
+
+def _actual_dollar_alloc(row) -> float | None:
+    """Compute the actual dollar allocation from limit price, qty, and FX."""
+    lp = row.get("limit_price")
+    qty = row.get("Qty")
+    fx = _get_fx(row)
+    if pd.isna(lp) or pd.isna(qty) or fx is None:
+        return None
+    return round(
+        float(lp) * float(qty) * _multiplier(row) / fx,
+        2,
+    )
+
+
+# ==================================================================
+# Currency resolution
+# ==================================================================
 
 def _try_forex_snapshot(ib: IB, pair: str) -> float | None:
     """Request a snapshot for Forex *pair* and return the rate, or None.
@@ -441,9 +517,32 @@ def resolve_currencies(ib: IB, df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-# ------------------------------------------------------------------
+# ==================================================================
 # Public API
-# ------------------------------------------------------------------
+# ==================================================================
+
+def fetch_net_liquidation(ib: IB) -> float:
+    """Fetch the account net liquidation value in USD from IBKR.
+
+    Uses ``ib.accountSummary()`` and looks for the ``NetLiquidation``
+    tag with ``USD`` currency.
+
+    Raises
+    ------
+    RuntimeError
+        If the net liquidation value cannot be found.
+    """
+    summary = ib.accountSummary()
+    for item in summary:
+        if item.tag == "NetLiquidation" and item.currency == "USD":
+            val = float(item.value)
+            if val > 0:
+                return val
+    raise RuntimeError(
+        "Could not retrieve NetLiquidation (USD) from account summary. "
+        "Make sure TWS is connected and has account data loaded."
+    )
+
 
 def fetch_market_data(ib: IB, df: pd.DataFrame) -> pd.DataFrame:
     """Populate market-data columns and compute limit prices.
@@ -467,45 +566,21 @@ def fetch_market_data(ib: IB, df: pd.DataFrame) -> pd.DataFrame:
 
     print(f"Fetching market data for {len(all_conids)} contracts ...")
 
-    # Build Contract stubs from conid and qualify in bulk.
+    # 1. Qualify contracts.
     contracts = [Contract(conId=cid) for cid in all_conids]
     qualified = ib.qualifyContracts(*contracts)
     print(f"  Qualified {len(qualified)}/{len(all_conids)} contracts")
 
-    # Map conid -> qualified contract (fallback to stub if needed).
     cid_to_contract: dict[int, Contract] = {
         c.conId: c for c in qualified if c.conId
     }
     contracts_list = [cid_to_contract[cid] for cid in all_conids
                       if cid in cid_to_contract]
 
-    # Ensure market_rule_ids column exists (needed for tick-size snapping).
-    # When loading from a saved CSV the column may be absent.
-    needs_rules = (
-        "market_rule_ids" not in df.columns
-        or df.loc[df["conid"].notna(), "market_rule_ids"]
-              .fillna("").astype(str).str.strip().eq("").all()
-    )
-    if needs_rules:
-        print("  Fetching market rules for tick-size snapping …")
-        mrids_map: dict[int, str] = {}
-        for c in contracts_list:
-            try:
-                cds = ib.reqContractDetails(c)
-                if cds:
-                    raw = cds[0].marketRuleIds or ""
-                    mrids_map[c.conId] = ",".join(
-                        dict.fromkeys(r.strip() for r in raw.split(",") if r.strip())
-                    )
-            except Exception:
-                pass
-        df["market_rule_ids"] = df["conid"].apply(
-            lambda cid: mrids_map.get(int(cid), "")
-            if pd.notna(cid) else ""
-        )
-        print(f"  Market rules fetched for {len(mrids_map)} contracts.")
+    # 2. Ensure market_rule_ids column exists (needed for tick-size snapping).
+    df = _ensure_market_rules(ib, df, contracts_list)
 
-    # Fetch snapshots in batches via reqTickers.
+    # 3. Fetch snapshots in batches.
     snapshot: dict[int, dict] = {}
     total_batches = math.ceil(len(contracts_list) / SNAPSHOT_BATCH_SIZE)
     for i in range(0, len(contracts_list), SNAPSHOT_BATCH_SIZE):
@@ -513,28 +588,24 @@ def fetch_market_data(ib: IB, df: pd.DataFrame) -> pd.DataFrame:
         batch_num = i // SNAPSHOT_BATCH_SIZE + 1
         print(f"  Batch {batch_num}/{total_batches} "
               f"({len(batch)} contracts) …")
-        batch_result = _snapshot_batch(ib, batch)
-        snapshot.update(batch_result)
+        snapshot.update(_snapshot_batch(ib, batch))
 
-    # Map results back to the DataFrame.
+    # 4. Map snapshot data to DataFrame columns.
     bids, asks, lasts, closes, highs, lows = [], [], [], [], [], []
     for _, row in df.iterrows():
         cid = row.get("conid")
         if pd.notna(cid) and int(cid) in snapshot:
             entry = snapshot[int(cid)]
-            bids.append(entry["bid"])
-            asks.append(entry["ask"])
-            lasts.append(entry["last"])
-            closes.append(entry["close"])
-            highs.append(entry["high"])
-            lows.append(entry["low"])
         else:
-            bids.append(None)
-            asks.append(None)
-            lasts.append(None)
-            closes.append(None)
-            highs.append(None)
-            lows.append(None)
+            entry = {"bid": None, "ask": None, "last": None,
+                     "close": None, "high": None, "low": None}
+
+        bids.append(entry["bid"])
+        asks.append(entry["ask"])
+        lasts.append(entry["last"])
+        closes.append(entry["close"])
+        highs.append(entry["high"])
+        lows.append(entry["low"])
 
     df["bid"] = bids
     df["ask"] = asks
@@ -543,61 +614,13 @@ def fetch_market_data(ib: IB, df: pd.DataFrame) -> pd.DataFrame:
     df["day_high"] = highs
     df["day_low"] = lows
 
+    # 5. Compute limit prices and snap to valid tick increments.
     df["limit_price"] = df.apply(_calc_limit_price, axis=1)
+    df["limit_price"] = df.apply(_snap_limit_price, axis=1, ib=ib)
 
-    # Snap limit prices to valid tick increments.
-    def _snap_limit(row):
-        lp = row.get("limit_price")
-        if pd.isna(lp):
-            return None
-        mrids = row.get("market_rule_ids")
-        if pd.isna(mrids) or not str(mrids).strip():
-            return lp
-        da = row.get("Dollar Allocation")
-        is_buy = pd.isna(da) or float(da) >= 0
-        snapped = snap_to_tick(float(lp), ib, str(mrids), is_buy=is_buy)
-        return round(snapped, 10)  # clean floating-point noise
-
-    df["limit_price"] = df.apply(_snap_limit, axis=1)
-
-    def _get_fx(r) -> float | None:
-        ccy = r.get("currency")
-        fx = r.get("fx_rate")
-        if pd.isna(ccy) or str(ccy).upper() == "USD":
-            return 1.0
-        if pd.notna(fx) and float(fx) > 0:
-            return float(fx)
-        return None
-
-    def _multiplier(r) -> int:
-        """Return 100 for options, 1 for stocks."""
-        return 100 if r.get("is_option") else 1
-
-    def _planned_qty(r):
-        lp = r.get("limit_price")
-        da = r.get("Dollar Allocation")
-        if pd.isna(lp) or pd.isna(da) or float(lp) <= 0:
-            return None
-        fx = _get_fx(r)
-        if fx is None:
-            return None
-        local_alloc = abs(float(da)) * fx
-        mult = _multiplier(r)
-        shares = round(local_alloc / (float(lp) * mult))
-        return shares if float(da) >= 0 else -shares
-
+    # 6. Compute planned quantities and actual dollar allocations.
     df["Qty"] = df.apply(_planned_qty, axis=1)
-    df["Actual Dollar Allocation"] = df.apply(
-        lambda r: round(
-            float(r["limit_price"]) * float(r["Qty"])
-            * _multiplier(r) / (_get_fx(r) or 1.0),
-            2,
-        )
-        if pd.notna(r.get("limit_price")) and pd.notna(r.get("Qty"))
-        and _get_fx(r) is not None
-        else None,
-        axis=1,
-    )
+    df["Actual Dollar Allocation"] = df.apply(_actual_dollar_alloc, axis=1)
 
     got_bid = df["bid"].notna().sum()
     got_last = df["last"].notna().sum()

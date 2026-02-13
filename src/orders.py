@@ -13,8 +13,10 @@ from dataclasses import dataclass, field
 import pandas as pd
 from ib_async import IB, Contract, LimitOrder, Trade
 
+from src.cancel import (
+    CancelState, resolve_cancel_decision, execute_cancel,
+)
 from src.config import MAXIMUM_AMOUNT_AUTOMATIC_ORDER
-from src.connection import suppress_errors
 from src.contracts import exchange_to_mic
 from src.exchange_hours import is_exchange_open
 from src.market_data import snap_to_tick
@@ -94,12 +96,7 @@ def cancel_all_orders(ib: IB,
     cancelled = 0
     failed = 0
     skipped = 0
-
-    # Per-exchange consent tracking.
-    cancel_confirm_all: bool = False
-    cancel_skip_all: bool = False
-    cancel_confirm_exchanges: set[str] = set()
-    cancel_skip_exchanges: set[str] = set()
+    state = CancelState()
 
     for trade in open_trades:
         c = trade.contract
@@ -116,69 +113,35 @@ def cancel_all_orders(ib: IB,
         remaining = o.totalQuantity
         price = o.lmtPrice if hasattr(o, "lmtPrice") else ""
 
-        # Determine MIC.
+        # Determine MIC and exchange-open status.
         raw_exchange = c.primaryExchange or c.exchange or ""
         mic = exchange_to_mic(raw_exchange) if raw_exchange else ""
+        can_cancel = all_exchanges or not mic or is_exchange_open(mic)
 
-        # Exchange filtering.
-        if not all_exchanges and mic:
-            if not is_exchange_open(mic):
-                print(f"  Skipped order {oid}  {side} {remaining} {ticker} "
-                      f"@ {price}  (exchange {mic} closed)")
-                skipped += 1
-                continue
+        order_desc = f"{side} {remaining} {ticker} @ {price}"
+        header = (
+            f"\n  Order {oid}  {order_desc}"
+            f"  (exchange: {mic or '?'})\n"
+            f"  Exchange: {mic or '?'}"
+        )
 
-        # Auto-skip check.
-        if cancel_skip_all or mic in cancel_skip_exchanges:
-            print(f"  Skipped order {oid}  {side} {remaining} {ticker} "
-                  f"@ {price}  (auto-skip)")
+        decision, is_auto = resolve_cancel_decision(
+            mic, can_cancel, state, prompt_header=header)
+
+        if decision == "skip":
+            reason = ("exchange closed" if not can_cancel
+                      else "auto-skip" if is_auto else "skipped")
+            print(f"  Skipped order {oid}  {order_desc}  ({reason})")
             skipped += 1
             continue
 
-        # Auto-confirm check.
-        auto = cancel_confirm_all or mic in cancel_confirm_exchanges
-
-        if not auto:
-            mic_label = mic or "?"
-            print(f"\n  Order {oid}  {side} {remaining} {ticker} @ {price}"
-                  f"  (exchange: {mic_label})")
-            choice = input(
-                f"  [Y] Cancel  [A] Cancel All  "
-                f"[E] Cancel All {mic_label}  "
-                f"[S] Skip  [X] Skip All {mic_label}  "
-                f"[N] Skip All  > "
-            ).strip().upper()
-
-            if choice == "A":
-                cancel_confirm_all = True
-            elif choice == "E":
-                cancel_confirm_exchanges.add(mic)
-            elif choice == "X":
-                cancel_skip_exchanges.add(mic)
-                skipped += 1
-                continue
-            elif choice == "N":
-                cancel_skip_all = True
-                skipped += 1
-                continue
-            elif choice == "S":
-                skipped += 1
-                continue
-            elif choice != "Y":
-                skipped += 1
-                continue
-
         # Proceed with cancellation.
-        try:
-            with suppress_errors(202):
-                ib.cancelOrder(o)
-                ib.sleep(0.3)
-            auto_tag = " (auto)" if auto else ""
-            print(f"  Cancelled order {oid}  {side} {remaining} "
-                  f"{ticker} @ {price}{auto_tag}")
+        if execute_cancel(ib, o):
+            auto_tag = " (auto)" if is_auto else ""
+            print(f"  Cancelled order {oid}  {order_desc}{auto_tag}")
             cancelled += 1
-        except Exception as exc:
-            print(f"  [!] Failed to cancel order {oid} ({ticker}): {exc}")
+        else:
+            print(f"  [!] Failed to cancel order {oid} ({ticker})")
             failed += 1
 
     parts = [f"{cancelled} cancelled", f"{failed} failed"]

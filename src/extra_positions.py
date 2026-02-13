@@ -15,8 +15,11 @@ from dataclasses import dataclass
 import pandas as pd
 from ib_async import IB, Contract
 
+from src.cancel import (
+    CancelState, signed_order_qty,
+    resolve_cancel_decision, execute_cancel,
+)
 from src.config import MINIMUM_TRADING_AMOUNT
-from src.connection import suppress_errors
 from src.contracts import exchange_to_mic
 from src.exchange_hours import is_exchange_open
 from src.market_data import (
@@ -64,9 +67,9 @@ def compute_net_quantity(
     return net
 
 
-# ------------------------------------------------------------------
+# ==================================================================
 # Per-conid metadata
-# ------------------------------------------------------------------
+# ==================================================================
 
 @dataclass
 class _ExtraInfo:
@@ -79,26 +82,9 @@ class _ExtraInfo:
     long_name: str
 
 
-# ------------------------------------------------------------------
-# Helpers
-# ------------------------------------------------------------------
-
-def _signed_qty(order: dict) -> float:
-    """Signed remaining quantity: positive for BUY, negative for SELL."""
-    qty = order["remainingQuantity"]
-    return qty if order["side"] == "BUY" else -qty
-
-
-def _keep_as_pending(
-    pending: dict[int, float], cid: int, order: dict,
-) -> None:
-    """Record a kept (non-cancelled) order by adding its signed qty."""
-    pending[cid] = pending.get(cid, 0) + _signed_qty(order)
-
-
-# ------------------------------------------------------------------
+# ==================================================================
 # Phase 1: Qualify contracts and gather metadata
-# ------------------------------------------------------------------
+# ==================================================================
 
 def _fetch_extra_metadata(
     ib: IB,
@@ -157,9 +143,9 @@ def _fetch_extra_metadata(
     return info
 
 
-# ------------------------------------------------------------------
+# ==================================================================
 # Phase 2: Fetch market-data snapshots
-# ------------------------------------------------------------------
+# ==================================================================
 
 def _fetch_extra_snapshots(
     ib: IB,
@@ -185,9 +171,9 @@ def _fetch_extra_snapshots(
     return snapshot
 
 
-# ------------------------------------------------------------------
+# ==================================================================
 # Phase 3: Cancel stale orders on extra positions
-# ------------------------------------------------------------------
+# ==================================================================
 
 def _cancel_extra_orders(
     ib: IB,
@@ -196,12 +182,9 @@ def _cancel_extra_orders(
     position_meta: dict[int, dict],
     info: dict[int, _ExtraInfo],
     all_exchanges: bool,
-    cancel_confirm_all: bool,
-    cancel_skip_all: bool,
-    cancel_confirm_exchanges: set[str],
-    cancel_skip_exchanges: set[str],
+    state: CancelState,
     dry_run: bool,
-) -> tuple[dict[int, float], int, bool, bool, set[str], set[str]]:
+) -> tuple[dict[int, float], int]:
     """Cancel stale orders for extra positions and track pending qty.
 
     For extra positions the target is 0, so every open order is stale.
@@ -210,9 +193,9 @@ def _cancel_extra_orders(
 
     Returns
     -------
-    pending_by_conid, cancelled_count,
-    cancel_confirm_all, cancel_skip_all,
-    cancel_confirm_exchanges, cancel_skip_exchanges
+    pending_by_conid : dict[int, float]
+        Signed pending quantity per conid (from kept orders only).
+    cancelled_count : int
     """
     cancelled = 0
     pending: dict[int, float] = {}
@@ -222,91 +205,54 @@ def _cancel_extra_orders(
         ei = info[cid]
         pm = position_meta.get(cid, {})
         raw_exchange = pm.get("exchange", "")
-        mic_code = exchange_to_mic(raw_exchange) if raw_exchange else ""
+        mic = exchange_to_mic(raw_exchange) if raw_exchange else ""
 
         # In dry-run mode, treat every order as kept (no cancellation).
         if dry_run:
             for order in conid_orders:
-                _keep_as_pending(pending, cid, order)
+                pending[cid] = pending.get(cid, 0) + signed_order_qty(order)
             continue
 
-        can_cancel = all_exchanges
-        if not can_cancel and mic_code:
-            can_cancel = is_exchange_open(mic_code)
+        can_cancel = all_exchanges or (bool(mic) and is_exchange_open(mic))
 
         for order in conid_orders:
-            if not can_cancel:
-                print(f"  Extra-position stale order "
-                      f"{order['orderId']} for '{ei.long_name}' kept "
-                      f"(exchange {mic_code} closed)")
-                _keep_as_pending(pending, cid, order)
+            header = (
+                f"\n  Extra-position stale order "
+                f"{order['orderId']} for '{ei.long_name}' "
+                f"(price={order.get('price')})\n"
+                f"  Exchange: {mic or '?'}"
+            )
+
+            decision, is_auto = resolve_cancel_decision(
+                mic, can_cancel, state, prompt_header=header)
+
+            if decision == "skip":
+                reason = ("exchange closed" if not can_cancel
+                          else "auto-skip" if is_auto else "skipped")
+                print(f"  Extra-position order {order['orderId']} "
+                      f"for '{ei.long_name}' — {reason}")
+                pending[cid] = pending.get(cid, 0) + signed_order_qty(order)
                 continue
 
-            if cancel_skip_all or mic_code in cancel_skip_exchanges:
-                print(f"  Extra-position stale order "
-                      f"{order['orderId']} for '{ei.long_name}' skipped "
-                      f"(auto-skip)")
-                _keep_as_pending(pending, cid, order)
-                continue
-
-            auto = (cancel_confirm_all
-                    or mic_code in cancel_confirm_exchanges)
-            if not auto:
-                mic_label = mic_code or "?"
-                print(f"\n  Extra-position stale order "
-                      f"{order['orderId']} for '{ei.long_name}' "
-                      f"(price={order.get('price')})")
-                print(f"  Exchange: {mic_label}")
-                choice = input(
-                    f"  [Y] Cancel  [A] Cancel All  "
-                    f"[E] Cancel All {mic_label}  "
-                    f"[S] Skip  [X] Skip All {mic_label}  "
-                    f"[N] Skip All  > "
-                ).strip().upper()
-
-                if choice == "A":
-                    cancel_confirm_all = True
-                elif choice == "E":
-                    cancel_confirm_exchanges.add(mic_code)
-                elif choice == "X":
-                    cancel_skip_exchanges.add(mic_code)
-                    _keep_as_pending(pending, cid, order)
-                    continue
-                elif choice == "N":
-                    cancel_skip_all = True
-                    _keep_as_pending(pending, cid, order)
-                    continue
-                elif choice == "S":
-                    _keep_as_pending(pending, cid, order)
-                    continue
-                elif choice != "Y":
-                    print(f"    Invalid choice, skipping.")
-                    _keep_as_pending(pending, cid, order)
-                    continue
-
-            try:
-                trade_obj = order.get("trade")
-                with suppress_errors(202):
-                    if trade_obj:
-                        ib.cancelOrder(trade_obj.order)
-                    ib.sleep(0.3)
-                auto_tag = " (auto)" if auto else ""
+            # Cancel.
+            trade_obj = order.get("trade")
+            if trade_obj and execute_cancel(ib, trade_obj.order):
+                auto_tag = " (auto)" if is_auto else ""
                 print(f"  Cancelled extra-position order "
-                      f"{order['orderId']} for '{ei.long_name}'{auto_tag}")
+                      f"{order['orderId']} for '{ei.long_name}'"
+                      f"{auto_tag}")
                 cancelled += 1
-            except Exception as exc:
+            else:
                 print(f"  [!] Failed to cancel order "
-                      f"{order['orderId']}: {exc}")
-                _keep_as_pending(pending, cid, order)
+                      f"{order['orderId']}")
+                pending[cid] = pending.get(cid, 0) + signed_order_qty(order)
 
-    return (pending, cancelled,
-            cancel_confirm_all, cancel_skip_all,
-            cancel_confirm_exchanges, cancel_skip_exchanges)
+    return pending, cancelled
 
 
-# ------------------------------------------------------------------
+# ==================================================================
 # Phase 4: Build synthetic DataFrame rows
-# ------------------------------------------------------------------
+# ==================================================================
 
 def _build_extra_rows(
     ib: IB,
@@ -385,9 +331,9 @@ def _build_extra_rows(
     return extra_rows
 
 
-# ------------------------------------------------------------------
+# ==================================================================
 # Public API
-# ------------------------------------------------------------------
+# ==================================================================
 
 def reconcile_extra_positions(
     ib: IB,
@@ -396,12 +342,9 @@ def reconcile_extra_positions(
     position_meta: dict[int, dict],
     orders_by_conid: dict[int, list[dict]],
     all_exchanges: bool,
-    cancel_confirm_all: bool,
-    cancel_skip_all: bool,
-    cancel_confirm_exchanges: set[str],
-    cancel_skip_exchanges: set[str],
+    cancel_state: CancelState,
     dry_run: bool = False,
-) -> tuple[list[dict], int, bool, bool, set[str], set[str]]:
+) -> tuple[list[dict], int]:
     """Process IBKR positions not in the input file.
 
     When *dry_run* is ``True``, no orders are cancelled — all open
@@ -414,8 +357,6 @@ def reconcile_extra_positions(
         Synthetic row dicts ready to be appended to the DataFrame.
     extra_cancelled : int
         Number of stale orders cancelled for extra positions.
-    cancel_confirm_all, cancel_skip_all : bool
-    cancel_confirm_exchanges, cancel_skip_exchanges : set[str]
     """
     print(f"\nFound {len(extra_conids)} IBKR position(s) not in the "
           f"input file. Fetching market data to prepare sell orders ...")
@@ -427,13 +368,9 @@ def reconcile_extra_positions(
     snapshot = _fetch_extra_snapshots(ib, extra_conids, info)
 
     # 3. Cancel stale orders (all orders are stale for extra positions).
-    (pending_by_conid, extra_cancelled,
-     cancel_confirm_all, cancel_skip_all,
-     cancel_confirm_exchanges, cancel_skip_exchanges,
-     ) = _cancel_extra_orders(
+    pending_by_conid, extra_cancelled = _cancel_extra_orders(
         ib, extra_conids, orders_by_conid, position_meta, info,
-        all_exchanges, cancel_confirm_all, cancel_skip_all,
-        cancel_confirm_exchanges, cancel_skip_exchanges, dry_run,
+        all_exchanges, cancel_state, dry_run,
     )
 
     # 4. Build synthetic rows for the order loop.
@@ -448,6 +385,4 @@ def reconcile_extra_positions(
     if extra_cancelled:
         print(f"  Extra-position orders cancelled: {extra_cancelled}")
 
-    return (extra_rows, extra_cancelled,
-            cancel_confirm_all, cancel_skip_all,
-            cancel_confirm_exchanges, cancel_skip_exchanges)
+    return extra_rows, extra_cancelled

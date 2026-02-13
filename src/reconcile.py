@@ -15,17 +15,20 @@ from __future__ import annotations
 import pandas as pd
 from ib_async import IB
 
+from src.cancel import (
+    CancelState, signed_order_qty,
+    resolve_cancel_decision, execute_cancel,
+)
 from src.config import STALE_ORDER_TOL_PCT, STALE_ORDER_TOL_PCT_ILLIQUID
-from src.connection import suppress_errors
 from src.exchange_hours import is_exchange_open
 from src.extra_positions import compute_net_quantity, reconcile_extra_positions
 from src.orders import get_account_id
 from src.contracts import exchange_to_mic
 
 
-# ------------------------------------------------------------------
+# ==================================================================
 # Data fetchers
-# ------------------------------------------------------------------
+# ==================================================================
 
 def _fetch_positions(ib: IB,
                      ) -> tuple[dict[int, float], dict[int, dict]]:
@@ -95,15 +98,9 @@ def _fetch_open_orders(ib: IB) -> list[dict]:
     return orders
 
 
-# ------------------------------------------------------------------
-# Core reconciliation
-# ------------------------------------------------------------------
-
-def _signed_order_qty(order: dict) -> float:
-    """BUY orders positive, SELL orders negative."""
-    qty = order["remainingQuantity"]
-    return qty if order["side"] == "BUY" else -qty
-
+# ==================================================================
+# Net-quantity computation
+# ==================================================================
 
 def compute_net_quantities(
     df: pd.DataFrame,
@@ -141,7 +138,7 @@ def compute_net_quantities(
 
         pending = 0.0
         for order in orders_by_conid.get(conid, []):
-            pending += _signed_order_qty(order)
+            pending += signed_order_qty(order)
 
         # Resolve FX rate for the min-trade filter.
         lp_raw = row.get("limit_price")
@@ -169,14 +166,36 @@ def compute_net_quantities(
     return out
 
 
+# ==================================================================
+# Stale-order cancellation
+# ==================================================================
+
+_ILLIQUID_MICS = {"XFRA", "OTCM"}
+
+
+def _is_order_stale(
+    order: dict, limit_price: float, tol_pct: float,
+) -> bool:
+    """Return True if the order's price deviates from *limit_price*
+    by more than *tol_pct* (fractional).
+    """
+    order_price = order.get("price")
+    if order_price is None or not limit_price:
+        return False
+    return abs(order_price - limit_price) / limit_price > tol_pct
+
+
 def _cancel_stale_orders(
     ib: IB,
     df: pd.DataFrame,
     orders_by_conid: dict[int, list[dict]],
     all_exchanges: bool,
-) -> tuple[dict[int, list[dict]], list[int],
-           bool, bool, set[str], set[str]]:
+    state: CancelState,
+) -> tuple[dict[int, list[dict]], list[int]]:
     """Cancel stale orders and return the remaining (non-cancelled) ones.
+
+    An order is *stale* when its limit price deviates from the
+    freshly computed limit price by more than the configured tolerance.
 
     Returns
     -------
@@ -184,23 +203,13 @@ def _cancel_stale_orders(
         Orders grouped by conid, with cancelled ones removed.
     cancelled_counts : list[int]
         Per-row count of cancelled orders (aligned with *df*).
-    cancel_confirm_all, cancel_skip_all : bool
-    cancel_confirm_exchanges, cancel_skip_exchanges : set[str]
     """
-    _ILLIQUID_MICS = {"XFRA", "OTCM"}
-
-    # Start with a copy — orders not touched by any row stay as-is.
     remaining: dict[int, list[dict]] = {
         cid: list(ords) for cid, ords in orders_by_conid.items()
     }
     cancelled_counts: list[int] = []
-
-    cancel_confirm_all: bool = False
-    cancel_skip_all: bool = False
-    cancel_confirm_exchanges: set[str] = set()
-    cancel_skip_exchanges: set[str] = set()
-
     total = len(df)
+
     for idx, row in df.iterrows():
         conid_raw = row.get("conid")
         limit_price_raw = row.get("limit_price")
@@ -218,105 +227,67 @@ def _cancel_stale_orders(
             continue
 
         mic = row.get("MIC Primary Exchange")
-        can_cancel = all_exchanges
-        if not can_cancel and pd.notna(mic) and str(mic).strip():
-            can_cancel = is_exchange_open(str(mic).strip())
-
         mic_str = str(mic).strip().upper() if pd.notna(mic) else ""
+        can_cancel = all_exchanges or (
+            bool(mic_str) and is_exchange_open(mic_str)
+        )
         tol_pct = (STALE_ORDER_TOL_PCT_ILLIQUID
                    if mic_str in _ILLIQUID_MICS
                    else STALE_ORDER_TOL_PCT)
 
         kept: list[dict] = []
         cancelled = 0
+        name = row.get("Name", "")
+        label = f"[{idx + 1}/{total}]"
 
         for order in conid_orders:
+            if not _is_order_stale(order, limit_price, tol_pct):
+                kept.append(order)
+                continue
+
+            # Order is stale — decide whether to cancel.
             order_price = order.get("price")
-            price_diff_pct = (abs(order_price - limit_price) / limit_price
-                              if order_price is not None and limit_price
-                              else None)
+            header = (
+                f"\n  {label} Stale order {order['orderId']} "
+                f"for '{name}' (old price={order_price}, "
+                f"new price={limit_price})\n"
+                f"  Exchange: {mic_str or '?'}"
+            )
 
-            if price_diff_pct is not None and price_diff_pct > tol_pct:
-                if not can_cancel:
-                    name = row.get("Name", "")
-                    print(f"  [{idx + 1}/{total}] Stale order "
-                          f"{order['orderId']} for '{name}' kept "
-                          f"(exchange {mic_str} closed)")
-                    kept.append(order)
-                    continue
+            decision, is_auto = resolve_cancel_decision(
+                mic_str, can_cancel, state, prompt_header=header)
 
-                name = row.get("Name", "")
+            if decision == "skip":
+                reason = ("exchange closed" if not can_cancel
+                          else "auto-skip" if is_auto else "skipped")
+                print(f"  {label} Stale order {order['orderId']} "
+                      f"for '{name}' — {reason}")
+                kept.append(order)
+                continue
 
-                if cancel_skip_all or mic_str in cancel_skip_exchanges:
-                    print(f"  [{idx + 1}/{total}] Stale order "
-                          f"{order['orderId']} for '{name}' skipped "
-                          f"(auto-skip)")
-                    kept.append(order)
-                    continue
-
-                auto = (cancel_confirm_all
-                        or mic_str in cancel_confirm_exchanges)
-
-                if not auto:
-                    print(f"\n  [{idx + 1}/{total}] Stale order "
-                          f"{order['orderId']} for '{name}' "
-                          f"(old price={order_price}, "
-                          f"new price={limit_price})")
-                    print(f"  Exchange: {mic_str or '?'}")
-                    mic_label = mic_str or "?"
-                    choice = input(
-                        f"  [Y] Cancel  [A] Cancel All  "
-                        f"[E] Cancel All {mic_label}  "
-                        f"[S] Skip  [X] Skip All {mic_label}  "
-                        f"[N] Skip All  > "
-                    ).strip().upper()
-
-                    if choice == "A":
-                        cancel_confirm_all = True
-                    elif choice == "E":
-                        cancel_confirm_exchanges.add(mic_str)
-                    elif choice == "X":
-                        cancel_skip_exchanges.add(mic_str)
-                        kept.append(order)
-                        continue
-                    elif choice == "N":
-                        cancel_skip_all = True
-                        kept.append(order)
-                        continue
-                    elif choice == "S":
-                        kept.append(order)
-                        continue
-                    elif choice != "Y":
-                        kept.append(order)
-                        continue
-
-                # Cancel the stale order via ib_async.
-                try:
-                    trade_obj = order.get("trade")
-                    with suppress_errors(202):
-                        if trade_obj:
-                            ib.cancelOrder(trade_obj.order)
-                        ib.sleep(0.3)
-                    auto_tag = " (auto)" if auto else ""
-                    print(f"  [{idx + 1}/{total}] Cancelled stale order "
-                          f"{order['orderId']} for '{name}' "
-                          f"(old price={order_price}, "
-                          f"new price={limit_price}){auto_tag}")
-                    cancelled += 1
-                except Exception as exc:
-                    print(f"  [!] Failed to cancel order "
-                          f"{order['orderId']}: {exc}")
-                    kept.append(order)
+            # Cancel the stale order.
+            trade_obj = order.get("trade")
+            if trade_obj and execute_cancel(ib, trade_obj.order):
+                auto_tag = " (auto)" if is_auto else ""
+                print(f"  {label} Cancelled stale order "
+                      f"{order['orderId']} for '{name}' "
+                      f"(old={order_price}, new={limit_price})"
+                      f"{auto_tag}")
+                cancelled += 1
             else:
+                print(f"  [!] Failed to cancel order "
+                      f"{order['orderId']}")
                 kept.append(order)
 
         remaining[conid] = kept
         cancelled_counts.append(cancelled)
 
-    return (remaining, cancelled_counts,
-            cancel_confirm_all, cancel_skip_all,
-            cancel_confirm_exchanges, cancel_skip_exchanges)
+    return remaining, cancelled_counts
 
+
+# ==================================================================
+# Public API
+# ==================================================================
 
 def reconcile(ib: IB,
               df: pd.DataFrame,
@@ -346,21 +317,19 @@ def reconcile(ib: IB,
     for o in open_orders:
         orders_by_conid.setdefault(o["conid"], []).append(o)
 
+    # Cancel consent state is shared between stale-order and
+    # extra-position cancellation so user choices carry over.
+    state = CancelState()
+
     if dry_run:
         # Read-only: skip cancellation, count all orders as pending.
         df = compute_net_quantities(df, positions, orders_by_conid)
         df["cancelled_orders"] = 0
         cancelled_counts: list[int] = [0] * len(df)
-        cancel_confirm_all = False
-        cancel_skip_all = False
-        cancel_confirm_exchanges: set[str] = set()
-        cancel_skip_exchanges: set[str] = set()
     else:
         # Phase 1: Cancel stale orders.
-        (remaining_orders, cancelled_counts,
-         cancel_confirm_all, cancel_skip_all,
-         cancel_confirm_exchanges, cancel_skip_exchanges,
-         ) = _cancel_stale_orders(ib, df, orders_by_conid, all_exchanges)
+        remaining_orders, cancelled_counts = _cancel_stale_orders(
+            ib, df, orders_by_conid, all_exchanges, state)
 
         # Phase 2: Compute net quantities with remaining orders.
         df = compute_net_quantities(df, positions, remaining_orders)
@@ -377,20 +346,14 @@ def reconcile(ib: IB,
 
     extra_cancelled = 0
     if extra_conids:
-        (extra_rows, extra_cancelled,
-         cancel_confirm_all, cancel_skip_all,
-         cancel_confirm_exchanges, cancel_skip_exchanges,
-         ) = reconcile_extra_positions(
+        extra_rows, extra_cancelled = reconcile_extra_positions(
             ib=ib,
             extra_conids=extra_conids,
             positions=positions,
             position_meta=position_meta,
             orders_by_conid=orders_by_conid,
             all_exchanges=all_exchanges,
-            cancel_confirm_all=cancel_confirm_all,
-            cancel_skip_all=cancel_skip_all,
-            cancel_confirm_exchanges=cancel_confirm_exchanges,
-            cancel_skip_exchanges=cancel_skip_exchanges,
+            cancel_state=state,
             dry_run=dry_run,
         )
 
