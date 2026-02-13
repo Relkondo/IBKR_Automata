@@ -67,7 +67,6 @@ for _mic, _preferred in [("XFRA", "FWB2"), ("XETR", "IBIS2")]:
         _MIC_TO_IBKR[_mic].insert(0, _preferred)
 
 
-
 def exchange_to_mic(exchange: str) -> str:
     """Convert an IBKR exchange abbreviation to its primary MIC code.
 
@@ -373,20 +372,17 @@ def resolve_conids(ib: IB, df: pd.DataFrame) -> pd.DataFrame:
 
         if result:
             cid, r_name, r_sym, eff, ccy, mrids = result
-            conids.append(cid)
-            api_names.append(r_name)
-            api_tickers.append(r_sym)
-            eff_mics.append(eff)
-            currencies.append(ccy)
-            market_rule_ids.append(mrids)
         else:
-            conids.append(None)
-            api_names.append(None)
-            api_tickers.append(None)
-            eff_mics.append(mic)
-            currencies.append(None)
-            market_rule_ids.append(None)
+            cid, r_name, r_sym, eff, ccy, mrids = (
+                None, None, None, mic, None, None)
             print(f"    [!] FAILED to resolve '{symbol}'")
+
+        conids.append(cid)
+        api_names.append(r_name)
+        api_tickers.append(r_sym)
+        eff_mics.append(eff)
+        currencies.append(ccy)
+        market_rule_ids.append(mrids)
 
         time.sleep(0.05)
 
