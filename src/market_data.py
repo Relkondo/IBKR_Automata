@@ -12,13 +12,15 @@ controls how aggressively we cross the bid/ask spread:
   100 = sit on the passive side (cheapest, may not fill)
 """
 
+import json
 import math
 import os
+import urllib.request
 
 import pandas as pd
 from ib_async import IB, Contract, Forex
 
-from src.config import OUTPUT_DIR
+from src.config import OUTPUT_DIR, PROJECT_PORTFOLIO_COLUMNS
 
 # ------------------------------------------------------------------
 # Snapshot batching
@@ -302,15 +304,53 @@ def _try_forex_snapshot(ib: IB, pair: str) -> float | None:
 # Currencies where the convention is {ccy}USD (ccy is base, not USD).
 _CCY_AS_BASE = {"EUR", "GBP", "AUD", "NZD"}
 
+# ---------- Web-based FX fallback (ExchangeRate-API, free, no key) ----------
+
+_WEB_FX_URL = "https://open.er-api.com/v6/latest/USD"
+_web_fx_cache: dict[str, float] | None = None
+
+
+def _fetch_web_fx_rate(ccy: str) -> float | None:
+    """Look up USD -> *ccy* from the free ExchangeRate-API.
+
+    Results are cached for the lifetime of the process (rates update daily).
+    Returns the rate (units of *ccy* per 1 USD) or None.
+    """
+    global _web_fx_cache
+    if _web_fx_cache is None:
+        try:
+            req = urllib.request.Request(
+                _WEB_FX_URL,
+                headers={"User-Agent": "IBKR_Automata/1.0"},
+            )
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                data = json.loads(resp.read().decode())
+            if data.get("result") == "success":
+                _web_fx_cache = data.get("rates", {})
+            else:
+                print("  [!] Web FX API returned unexpected payload.")
+                _web_fx_cache = {}
+        except Exception as exc:
+            print(f"  [!] Web FX API request failed: {exc}")
+            _web_fx_cache = {}  # don't retry on every call
+
+    rate = _web_fx_cache.get(ccy.upper())
+    if rate is not None and rate > 0:
+        return float(rate)
+    return None
+
 
 def _resolve_fx_rate(ib: IB, ccy: str) -> float | None:
     """Obtain the USD -> *ccy* exchange rate.
 
-    Tries the standard Forex pair convention first, then the reverse.
-    Falls back to manual input.
+    Strategy (in order):
+      1. IBKR Forex snapshot (standard pair convention, then reverse).
+      2. Free web API (open.er-api.com — covers exotic pairs like TWD).
+      3. Manual user input as a last resort.
 
     Returns the rate (units of *ccy* per 1 USD) or None.
     """
+    # --- Attempt 1: IBKR Forex snapshot ---
     if ccy in _CCY_AS_BASE:
         # Convention: {ccy}USD → price is "USD per 1 ccy", invert.
         rate = _try_forex_snapshot(ib, f"{ccy}USD")
@@ -335,6 +375,12 @@ def _resolve_fx_rate(ib: IB, ccy: str) -> float | None:
             inverted = round(1.0 / rate, 6)
             print(f"  USD -> {ccy} = {inverted}")
             return inverted
+
+    # --- Attempt 2: free web API ---
+    web_rate = _fetch_web_fx_rate(ccy)
+    if web_rate is not None:
+        print(f"  USD -> {ccy} = {web_rate} (web)")
+        return web_rate
 
     # --- Attempt 3: manual input ---
     print(f"  [!] Could not fetch Forex rate for {ccy}.")
@@ -456,7 +502,10 @@ def fetch_market_data(ib: IB, df: pd.DataFrame) -> pd.DataFrame:
             try:
                 cds = ib.reqContractDetails(c)
                 if cds:
-                    mrids_map[c.conId] = cds[0].marketRuleIds or ""
+                    raw = cds[0].marketRuleIds or ""
+                    mrids_map[c.conId] = ",".join(
+                        dict.fromkeys(r.strip() for r in raw.split(",") if r.strip())
+                    )
             except Exception:
                 pass
         df["market_rule_ids"] = df["conid"].apply(
@@ -529,6 +578,10 @@ def fetch_market_data(ib: IB, df: pd.DataFrame) -> pd.DataFrame:
             return float(fx)
         return None
 
+    def _multiplier(r) -> int:
+        """Return 100 for options, 1 for stocks."""
+        return 100 if r.get("is_option") else 1
+
     def _planned_qty(r):
         lp = r.get("limit_price")
         da = r.get("Dollar Allocation")
@@ -538,13 +591,15 @@ def fetch_market_data(ib: IB, df: pd.DataFrame) -> pd.DataFrame:
         if fx is None:
             return None
         local_alloc = abs(float(da)) * fx
-        shares = round(local_alloc / float(lp))
+        mult = _multiplier(r)
+        shares = round(local_alloc / (float(lp) * mult))
         return shares if float(da) >= 0 else -shares
 
     df["Qty"] = df.apply(_planned_qty, axis=1)
     df["Actual Dollar Allocation"] = df.apply(
         lambda r: round(
-            float(r["limit_price"]) * float(r["Qty"]) / (_get_fx(r) or 1.0),
+            float(r["limit_price"]) * float(r["Qty"])
+            * _multiplier(r) / (_get_fx(r) or 1.0),
             2,
         )
         if pd.notna(r.get("limit_price")) and pd.notna(r.get("Qty"))
@@ -568,6 +623,11 @@ def save_project_portfolio(df: pd.DataFrame) -> str:
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     out_path = os.path.join(OUTPUT_DIR, "Project_Portfolio.csv")
     drop_cols = [c for c in ("effective_ticker",) if c in df.columns]
-    df.drop(columns=drop_cols).to_csv(out_path, index=False)
+    out = df.drop(columns=drop_cols)
+    # Order columns: listed config columns first, then any extras.
+    ordered = [c for c in PROJECT_PORTFOLIO_COLUMNS if c in out.columns]
+    extras = [c for c in out.columns if c not in ordered]
+    out = out[ordered + extras]
+    out.to_csv(out_path, index=False)
     print(f"Portfolio saved to {out_path}")
     return out_path

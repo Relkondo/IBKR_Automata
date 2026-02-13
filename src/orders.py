@@ -10,6 +10,7 @@ import math
 import pandas as pd
 from ib_async import IB, Contract, LimitOrder, Trade
 
+from src.config import MAXIMUM_AMOUNT_AUTOMATIC_ORDER
 from src.contracts import exchange_to_mic
 from src.exchange_hours import is_exchange_open
 from src.market_data import snap_to_tick
@@ -167,6 +168,251 @@ def _place_order(ib: IB, contract: Contract, order: LimitOrder,
 # Interactive loop
 # ------------------------------------------------------------------
 
+def _compute_usd_amount(limit_price: float, quantity: int,
+                        multiplier: int, fx: float) -> float:
+    """Return the USD notional value of an order."""
+    local_amount = limit_price * quantity * multiplier
+    return round(local_amount / fx, 2) if fx > 0 else local_amount
+
+
+def _place_single_order(
+    ib: IB,
+    row: pd.Series,
+    order_contract: Contract,
+    *,
+    idx_label: str,
+    name: str,
+    ticker: str,
+    conid: int,
+    limit_price: float,
+    quantity: int,
+    side: str,
+    multiplier: int,
+    ccy_label: str,
+    is_foreign: bool,
+    fx: float,
+    dollar_alloc: float,
+    net_qty_raw,
+    mic_str: str,
+    placed_orders: list[dict],
+    allow_auto: bool,
+    confirm_all: bool,
+    auto_confirm_exchanges: set[str],
+    auto_skip_exchanges: set[str],
+    deferred_orders: list[dict] | None,
+) -> str:
+    """Run the prompt-loop for one order.
+
+    Returns a control signal:
+      "next"  – move to the next row
+      "quit"  – abort the whole loop
+    Side-effects: mutates *placed_orders*, *confirm_all*,
+    *auto_confirm_exchanges*, *auto_skip_exchanges*.
+    """
+    while True:
+        local_amount = round(limit_price * quantity * multiplier, 2)
+        details_str = (
+            f"\n{idx_label} {name} ({ticker})\n"
+            f"  Side              : {side}\n"
+            f"  Exchange          : {mic_str or '?'}\n"
+            f"  Currency          : {ccy_label}\n"
+            f"  Limit Price       : {limit_price:,.2f} {ccy_label}\n"
+            f"  Quantity          : {quantity}\n"
+            f"  Amount            : {local_amount:,.2f} {ccy_label}\n"
+        )
+        if is_foreign:
+            usd_amount = (round(local_amount / fx, 2)
+                          if fx > 0 else None)
+            if usd_amount is not None:
+                details_str += (f"  Amount (USD)      : "
+                                f"{_format_currency(usd_amount)}\n")
+        if pd.notna(net_qty_raw):
+            existing = row.get("existing_qty", 0)
+            pending = row.get("pending_qty", 0)
+            target = row.get("target_qty", 0)
+            details_str += (
+                f"  --- reconciliation ---\n"
+                f"  Target qty        : {target}\n"
+                f"  Existing position : {int(existing)}\n"
+                f"  Pending orders    : {int(pending)}\n"
+                f"  Net to order      : {int(net_qty_raw)}\n"
+            )
+        else:
+            details_str += (
+                f"  Dollar Allocation : "
+                f"{_format_currency(dollar_alloc)}\n"
+            )
+        print(details_str)
+
+        is_auto = allow_auto and (
+            confirm_all or mic_str in auto_confirm_exchanges
+        )
+        if is_auto:
+            # Guardrail: defer large orders for explicit approval.
+            usd_val = _compute_usd_amount(
+                limit_price, quantity, multiplier, fx)
+            if (deferred_orders is not None
+                    and usd_val > MAXIMUM_AMOUNT_AUTOMATIC_ORDER):
+                print(
+                    f"  (deferred — USD amount "
+                    f"{_format_currency(usd_val)} exceeds "
+                    f"{_format_currency(MAXIMUM_AMOUNT_AUTOMATIC_ORDER)}"
+                    f" auto-confirm threshold)")
+                deferred_orders.append({
+                    "row": row,
+                    "order_contract": order_contract,
+                    "idx_label": idx_label,
+                    "name": name,
+                    "ticker": ticker,
+                    "conid": conid,
+                    "limit_price": limit_price,
+                    "quantity": quantity,
+                    "side": side,
+                    "multiplier": multiplier,
+                    "ccy_label": ccy_label,
+                    "is_foreign": is_foreign,
+                    "fx": fx,
+                    "dollar_alloc": dollar_alloc,
+                    "net_qty_raw": net_qty_raw,
+                    "mic_str": mic_str,
+                })
+                return "next"
+            choice = "Y"
+            print("  (auto-confirmed)")
+        else:
+            mic_label = mic_str or "?"
+            choice = input(
+                f"  [Y] Confirm  [A] Confirm All  "
+                f"[E] Confirm All {mic_label}  [M] Modify\n"
+                f"  [S] Skip  [X] Skip All {mic_label}  "
+                f"[Q] Quit  > "
+            ).strip().upper()
+
+        if choice in ("Y", "A", "E"):
+            if choice == "A":
+                confirm_all = True
+            elif choice == "E":
+                auto_confirm_exchanges.add(mic_str)
+
+            order = LimitOrder(side, quantity, limit_price)
+            order.tif = "DAY"
+
+            try:
+                trade = _place_order(ib, order_contract, order)
+                status = trade.orderStatus.status
+
+                # Check for Error 110 (tick-size rejection).
+                has_tick_error = any(
+                    getattr(e, "errorCode", 0) == 110
+                    for e in trade.log
+                )
+                if has_tick_error:
+                    # Fetch market rules and snap the price.
+                    mrids = row.get("market_rule_ids")
+                    if pd.isna(mrids) or not str(mrids).strip():
+                        try:
+                            cds = ib.reqContractDetails(
+                                order_contract)
+                            if cds:
+                                mrids = cds[0].marketRuleIds or ""
+                        except Exception:
+                            mrids = ""
+                    mrids = str(mrids).strip() if mrids else ""
+                    if mrids:
+                        is_buy = side == "BUY"
+                        adjusted = round(
+                            snap_to_tick(limit_price, ib, mrids,
+                                         is_buy=is_buy),
+                            10,
+                        )
+                        if adjusted != limit_price:
+                            print(
+                                f"    Price "
+                                f"{_format_currency(limit_price)} "
+                                f"rejected (tick-size). Retrying at "
+                                f"{_format_currency(adjusted)} …")
+                            limit_price = adjusted
+                            continue
+                    print(f"    [!] Tick-size error but could not "
+                          f"determine valid tick — skipping.")
+                    break
+
+                order_id = trade.order.orderId
+                print(f"    Order placed -- order_id: {order_id} "
+                      f"(status: {status})")
+                if status == "Cancelled":
+                    print(f"    [!] Order {order_id} was immediately "
+                          f"cancelled — not counting as placed.")
+                else:
+                    placed_orders.append({
+                        "ticker": ticker,
+                        "name": name,
+                        "conid": conid,
+                        "side": side,
+                        "quantity": quantity,
+                        "limit_price": limit_price,
+                        "order_id": order_id,
+                    })
+            except Exception as exc:
+                print(f"    [!] Order failed: {exc}")
+                if is_auto:
+                    print("    Skipping (auto-confirm mode).")
+                else:
+                    retry = input(
+                        "    [R] Retry  [S] Skip  > "
+                    ).strip().upper()
+                    if retry == "R":
+                        continue
+            break
+
+        elif choice == "M":
+            new_qty = input(
+                f"  New quantity [{quantity}]: ").strip()
+            if new_qty:
+                try:
+                    quantity = int(new_qty.replace(",", ""))
+                except ValueError:
+                    print("    Invalid number, keeping original.")
+
+            new_price = input(
+                f"  New limit price "
+                f"[{_format_currency(limit_price)}]: "
+            ).strip()
+            if new_price:
+                try:
+                    limit_price = float(
+                        new_price.replace(",", "").replace("$", ""))
+                except ValueError:
+                    print("    Invalid number, keeping original.")
+
+            new_side = input(
+                f"  New side [{side}]: ").strip().upper()
+            if new_side in ("BUY", "SELL"):
+                side = new_side
+            elif new_side:
+                print("    Invalid side, keeping original.")
+            continue
+
+        elif choice == "X":
+            auto_skip_exchanges.add(mic_str)
+            print(f"    Skipped (+ auto-skip all {mic_str}).")
+            break
+
+        elif choice == "S":
+            print("    Skipped.")
+            break
+
+        elif choice == "Q":
+            print("    Quitting order loop.")
+            return "quit"
+
+        else:
+            print("    Invalid choice. "
+                  "Please enter Y, A, E, M, S, X, or Q.")
+
+    return "next"
+
+
 def run_order_loop(ib: IB, df: pd.DataFrame) -> list[dict]:
     """Iterate over the portfolio and interactively place orders.
 
@@ -174,6 +420,7 @@ def run_order_loop(ib: IB, df: pd.DataFrame) -> list[dict]:
     """
     account_id = get_account_id(ib)
     placed_orders: list[dict] = []
+    deferred_orders: list[dict] = []
     confirm_all = False
     auto_confirm_exchanges: set[str] = set()
     auto_skip_exchanges: set[str] = set()
@@ -217,6 +464,10 @@ def run_order_loop(ib: IB, df: pd.DataFrame) -> list[dict]:
         limit_price = float(limit_price)
         dollar_alloc = float(dollar_alloc)
 
+        # Option multiplier (each contract = 100 shares).
+        is_option = bool(row.get("is_option"))
+        multiplier = 100 if is_option else 1
+
         # Determine side and quantity.
         net_qty_raw = row.get("net_quantity")
         if pd.notna(net_qty_raw):
@@ -230,8 +481,10 @@ def run_order_loop(ib: IB, df: pd.DataFrame) -> list[dict]:
         else:
             side = "SELL" if dollar_alloc < 0 else "BUY"
             local_alloc = abs(dollar_alloc) * fx
-            quantity_initial = (math.floor(local_alloc / limit_price)
-                                if limit_price > 0 else 0)
+            quantity_initial = (
+                math.floor(local_alloc / (limit_price * multiplier))
+                if limit_price > 0 else 0
+            )
 
         quantity = quantity_initial
 
@@ -255,176 +508,69 @@ def run_order_loop(ib: IB, df: pd.DataFrame) -> list[dict]:
         except Exception:
             pass
 
-        # --- Prompt loop ---
-        while True:
-            local_amount = round(limit_price * quantity, 2)
-            details_str = (
-                f"\n[{idx + 1}/{total}] {name} ({ticker})\n"
-                f"  Side              : {side}\n"
-                f"  Exchange          : {mic_str or '?'}\n"
-                f"  Currency          : {ccy_label}\n"
-                f"  Limit Price       : {limit_price:,.2f} {ccy_label}\n"
-                f"  Quantity          : {quantity}\n"
-                f"  Amount            : {local_amount:,.2f} {ccy_label}\n"
+        signal = _place_single_order(
+            ib, row, order_contract,
+            idx_label=f"[{idx + 1}/{total}]",
+            name=name,
+            ticker=ticker,
+            conid=conid,
+            limit_price=limit_price,
+            quantity=quantity,
+            side=side,
+            multiplier=multiplier,
+            ccy_label=ccy_label,
+            is_foreign=is_foreign,
+            fx=fx,
+            dollar_alloc=dollar_alloc,
+            net_qty_raw=net_qty_raw,
+            mic_str=mic_str,
+            placed_orders=placed_orders,
+            allow_auto=True,
+            confirm_all=confirm_all,
+            auto_confirm_exchanges=auto_confirm_exchanges,
+            auto_skip_exchanges=auto_skip_exchanges,
+            deferred_orders=deferred_orders,
+        )
+        if signal == "quit":
+            return placed_orders
+
+    # ------------------------------------------------------------------
+    # Process deferred large orders (explicit manual approval required)
+    # ------------------------------------------------------------------
+    if deferred_orders:
+        n = len(deferred_orders)
+        print(f"\n{'=' * 78}")
+        print(f"  {n} LARGE ORDER(S) DEFERRED — MANUAL APPROVAL REQUIRED")
+        print(f"  (USD amount > "
+              f"{_format_currency(MAXIMUM_AMOUNT_AUTOMATIC_ORDER)})")
+        print(f"{'=' * 78}")
+
+        for d in deferred_orders:
+            signal = _place_single_order(
+                ib, d["row"], d["order_contract"],
+                idx_label=d["idx_label"],
+                name=d["name"],
+                ticker=d["ticker"],
+                conid=d["conid"],
+                limit_price=d["limit_price"],
+                quantity=d["quantity"],
+                side=d["side"],
+                multiplier=d["multiplier"],
+                ccy_label=d["ccy_label"],
+                is_foreign=d["is_foreign"],
+                fx=d["fx"],
+                dollar_alloc=d["dollar_alloc"],
+                net_qty_raw=d["net_qty_raw"],
+                mic_str=d["mic_str"],
+                placed_orders=placed_orders,
+                allow_auto=False,  # force manual prompt
+                confirm_all=False,
+                auto_confirm_exchanges=set(),
+                auto_skip_exchanges=set(),
+                deferred_orders=None,  # no re-deferral
             )
-            if is_foreign:
-                usd_amount = (round(local_amount / fx, 2)
-                              if fx > 0 else None)
-                if usd_amount is not None:
-                    details_str += (f"  Amount (USD)      : "
-                                    f"{_format_currency(usd_amount)}\n")
-            if pd.notna(net_qty_raw):
-                existing = row.get("existing_qty", 0)
-                pending = row.get("pending_qty", 0)
-                target = row.get("target_qty", 0)
-                details_str += (
-                    f"  --- reconciliation ---\n"
-                    f"  Target qty        : {target}\n"
-                    f"  Existing position : {int(existing)}\n"
-                    f"  Pending orders    : {int(pending)}\n"
-                    f"  Net to order      : {int(net_qty_raw)}\n"
-                )
-            else:
-                details_str += (
-                    f"  Dollar Allocation : "
-                    f"{_format_currency(dollar_alloc)}\n"
-                )
-            print(details_str)
-
-            if confirm_all or mic_str in auto_confirm_exchanges:
-                choice = "Y"
-                print("  (auto-confirmed)")
-            else:
-                mic_label = mic_str or "?"
-                choice = input(
-                    f"  [Y] Confirm  [A] Confirm All  "
-                    f"[E] Confirm All {mic_label}  [M] Modify\n"
-                    f"  [S] Skip  [X] Skip All {mic_label}  "
-                    f"[Q] Quit  > "
-                ).strip().upper()
-
-            if choice in ("Y", "A", "E"):
-                if choice == "A":
-                    confirm_all = True
-                elif choice == "E":
-                    auto_confirm_exchanges.add(mic_str)
-
-                order = LimitOrder(side, quantity, limit_price)
-                order.tif = "DAY"
-
-                try:
-                    trade = _place_order(ib, order_contract, order)
-                    status = trade.orderStatus.status
-
-                    # Check for Error 110 (tick-size rejection).
-                    has_tick_error = any(
-                        getattr(e, "errorCode", 0) == 110
-                        for e in trade.log
-                    )
-                    if has_tick_error:
-                        # Fetch market rules and snap the price.
-                        mrids = row.get("market_rule_ids")
-                        if pd.isna(mrids) or not str(mrids).strip():
-                            # Fetch from contract details on the fly.
-                            try:
-                                cds = ib.reqContractDetails(
-                                    order_contract)
-                                if cds:
-                                    mrids = cds[0].marketRuleIds or ""
-                            except Exception:
-                                mrids = ""
-                        mrids = str(mrids).strip() if mrids else ""
-                        if mrids:
-                            is_buy = side == "BUY"
-                            adjusted = round(
-                                snap_to_tick(limit_price, ib, mrids,
-                                             is_buy=is_buy),
-                                10,
-                            )
-                            if adjusted != limit_price:
-                                print(
-                                    f"    Price "
-                                    f"{_format_currency(limit_price)} "
-                                    f"rejected (tick-size). Retrying at "
-                                    f"{_format_currency(adjusted)} …")
-                                limit_price = adjusted
-                                continue
-                        print(f"    [!] Tick-size error but could not "
-                              f"determine valid tick — skipping.")
-                        break
-
-                    order_id = trade.order.orderId
-                    print(f"    Order placed -- order_id: {order_id} "
-                          f"(status: {status})")
-                    if status == "Cancelled":
-                        print(f"    [!] Order {order_id} was immediately "
-                              f"cancelled — not counting as placed.")
-                    else:
-                        placed_orders.append({
-                            "ticker": ticker,
-                            "name": name,
-                            "conid": conid,
-                            "side": side,
-                            "quantity": quantity,
-                            "limit_price": limit_price,
-                            "order_id": order_id,
-                        })
-                except Exception as exc:
-                    print(f"    [!] Order failed: {exc}")
-                    if confirm_all:
-                        print("    Skipping (auto-confirm mode).")
-                    else:
-                        retry = input(
-                            "    [R] Retry  [S] Skip  > "
-                        ).strip().upper()
-                        if retry == "R":
-                            continue
+            if signal == "quit":
                 break
-
-            elif choice == "M":
-                new_qty = input(
-                    f"  New quantity [{quantity}]: ").strip()
-                if new_qty:
-                    try:
-                        quantity = int(new_qty.replace(",", ""))
-                    except ValueError:
-                        print("    Invalid number, keeping original.")
-
-                new_price = input(
-                    f"  New limit price "
-                    f"[{_format_currency(limit_price)}]: "
-                ).strip()
-                if new_price:
-                    try:
-                        limit_price = float(
-                            new_price.replace(",", "").replace("$", ""))
-                    except ValueError:
-                        print("    Invalid number, keeping original.")
-
-                new_side = input(
-                    f"  New side [{side}]: ").strip().upper()
-                if new_side in ("BUY", "SELL"):
-                    side = new_side
-                elif new_side:
-                    print("    Invalid side, keeping original.")
-                continue
-
-            elif choice == "X":
-                auto_skip_exchanges.add(mic_str)
-                print(f"    Skipped (+ auto-skip all {mic_str}).")
-                break
-
-            elif choice == "S":
-                print("    Skipped.")
-                break
-
-            elif choice == "Q":
-                print("    Quitting order loop.")
-                return placed_orders
-
-            else:
-                print("    Invalid choice. "
-                      "Please enter Y, A, E, M, S, X, or Q.")
 
     return placed_orders
 

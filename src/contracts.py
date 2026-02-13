@@ -115,12 +115,19 @@ def _search_by_name(ib: IB, name: str) -> list:
         return []
 
 
+def _dedup_rule_ids(raw: str | None) -> str:
+    """Deduplicate a comma-separated marketRuleIds string."""
+    if not raw:
+        return ""
+    return ",".join(dict.fromkeys(r.strip() for r in raw.split(",") if r.strip()))
+
+
 def _result_from(cd, eff_mic: str | None = None):
     """Build the resolution tuple from a ContractDetails."""
     c = cd.contract
     return c.conId, cd.longName, c.symbol, (
         eff_mic or exchange_to_mic(c.primaryExchange or "")
-    ), (c.currency or "USD"), (cd.marketRuleIds or "")
+    ), (c.currency or "USD"), _dedup_rule_ids(cd.marketRuleIds)
 
 
 def _query_on_exchanges(ib: IB, symbol: str, mic: str | None) -> list:
@@ -324,7 +331,7 @@ def _resolve_option(
         od.longName
         or f"{c.symbol} {c.lastTradeDateOrContractMonth} {right}{strike}"
     )
-    return c.conId, desc, c.symbol, mic, (c.currency or "USD"), (od.marketRuleIds or "")
+    return c.conId, desc, c.symbol, mic, (c.currency or "USD"), _dedup_rule_ids(od.marketRuleIds)
 
 
 # ---------------------------------------------------------------------------
