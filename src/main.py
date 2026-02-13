@@ -14,7 +14,8 @@ CLI arguments
 -------------
   noop               Run steps 1-4 only (skip order placement).
   noop-recalculate   Re-use conids from the saved Project_Portfolio.csv
-                     but re-fetch live market data and re-save.
+                     but re-fetch net liquidation, recompute dollar
+                     allocations, re-fetch live market data, and re-save.
   project-portfolio  Re-use output/Project_Portfolio.csv from a previous
                      noop run: connect (step 1), then jump straight to
                      the interactive order loop (steps 5-7).
@@ -81,6 +82,10 @@ def main() -> None:
               "'cancel-all-orders', and 'print-project-vs-current' "
               "are mutually exclusive.")
         sys.exit(1)
+    if buy_all and print_comparison:
+        print("Error: 'buy-all' and 'print-project-vs-current' cannot be "
+              "combined (the comparison requires reconciliation data).")
+        sys.exit(1)
 
     if print_comparison:
         print("Running in PRINT-PROJECT-VS-CURRENT mode.\n")
@@ -126,6 +131,11 @@ def main() -> None:
         # ==============================================================
         elif noop_recalc:
             df = _load_project_portfolio()
+
+            # Recompute Dollar Allocation from current net liquidation.
+            net_liq = fetch_net_liquidation(ib)
+            print(f"Net Liquidation (USD): ${net_liq:,.2f}\n")
+            df["Dollar Allocation"] = (df["Basket Allocation"] / 100 * net_liq).round(2)
 
             # Resolve currencies & exchange rates.
             df = resolve_currencies(ib, df)

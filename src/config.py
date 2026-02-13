@@ -46,6 +46,3 @@ PROJECT_PORTFOLIO_COLUMNS = [
     "Qty",
     "Actual Dollar Allocation",
 ]
-
-# --- API Keys ---
-OPENAI_API_KEY_FILE = "/Users/samuelcoron/Keys/OpenAI_API"

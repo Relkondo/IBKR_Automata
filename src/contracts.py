@@ -165,8 +165,9 @@ def _query_on_redirects(
 
 def _resolve_stock(
     ib: IB, symbol: str, mic: str | None, name: str | None,
-) -> tuple[int, str | None, str | None, str | None] | None:
-    """Resolve a stock to ``(conid, long_name, api_symbol, effective_mic)``.
+) -> tuple[int, str | None, str | None, str | None, str, str] | None:
+    """Resolve a stock to ``(conid, long_name, api_symbol, effective_mic,
+    currency, market_rule_ids)``.
 
     Non-redirected exchanges:
       1. Try ticker on target exchange(s), then SMART.
@@ -188,7 +189,7 @@ def _resolve_stock(
 
 def _resolve_direct(
     ib: IB, symbol: str, mic: str | None, name: str | None,
-) -> tuple[int, str | None, str | None, str | None] | None:
+) -> tuple[int, str | None, str | None, str | None, str, str] | None:
     """Non-redirected: try ticker, then name.  Pick first on expected exchange."""
     acceptable = [mic] if mic else []
 
@@ -225,7 +226,7 @@ def _resolve_direct(
 def _resolve_redirected(
     ib: IB, symbol: str, mic: str | None, name: str | None,
     redirects: list[str],
-) -> tuple[int, str | None, str | None, str | None] | None:
+) -> tuple[int, str | None, str | None, str | None, str, str] | None:
     """Redirected: search by name, prefer exact name match on redirect exchange.
 
     Falls back to the original exchange if no redirect listing is found.
@@ -276,8 +277,9 @@ def _resolve_redirected(
 
 def _resolve_option(
     ib: IB, ticker: str, mic: str | None, name: str | None,
-) -> tuple[int, str | None, str | None, str | None] | None:
-    """Resolve an option to ``(conid, description, symbol, mic)``.
+) -> tuple[int, str | None, str | None, str | None, str, str] | None:
+    """Resolve an option to ``(conid, description, symbol, mic,
+    currency, market_rule_ids)``.
 
     Parses tickers like ``"QQQ US 02/27/26 P600 Equity"``, qualifies
     the underlying stock, then looks up the exact option contract.

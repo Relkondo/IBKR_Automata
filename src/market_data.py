@@ -100,17 +100,6 @@ def _applicable_increment(
     return increment
 
 
-def _fetch_market_rules(ib: IB, rule_ids_str: str) -> list[tuple[float, float]]:
-    """Fetch and cache price-increment rules (kept for import compat).
-
-    Returns the rules for the first rule ID.  For full tick-size
-    snapping, use ``snap_to_tick`` which checks ALL rule IDs.
-    """
-    if not rule_ids_str:
-        return []
-    first_id = int(rule_ids_str.split(",")[0].strip())
-    return _fetch_single_rule(ib, first_id)
-
 
 def snap_to_tick(
     price: float,
@@ -227,7 +216,7 @@ def _snapshot_batch(
 # Limit-price calculation
 # ------------------------------------------------------------------
 
-def _calc_limit_price(row) -> float | None:
+def _calc_limit_price(row, *, is_sell: bool | None = None) -> float | None:
     """Compute the limit price for a single row.
 
     Uses a spread-based formula controlled by ``FILL_PATIENCE`` (0-100):
@@ -245,14 +234,21 @@ def _calc_limit_price(row) -> float | None:
         100 → sell at ask (patient, may not fill)
 
     Fallbacks when bid/ask unavailable: ``last``, then ``close``.
+
+    Parameters
+    ----------
+    is_sell : bool | None
+        Override buy/sell determination.  When ``None`` (default), the
+        direction is inferred from the row's ``Dollar Allocation``.
     """
     bid = row.get("bid")
     ask = row.get("ask")
     last = row.get("last")
     close = row.get("close")
 
-    dollar_alloc = row.get("Dollar Allocation")
-    is_sell = pd.notna(dollar_alloc) and float(dollar_alloc) < 0
+    if is_sell is None:
+        dollar_alloc = row.get("Dollar Allocation")
+        is_sell = pd.notna(dollar_alloc) and float(dollar_alloc) < 0
 
     # Primary: spread-based formula when both bid and ask exist.
     if pd.notna(bid) and pd.notna(ask):
@@ -622,12 +618,10 @@ def save_project_portfolio(df: pd.DataFrame) -> str:
     """Export the portfolio table to ``output/Project_Portfolio.csv``."""
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     out_path = os.path.join(OUTPUT_DIR, "Project_Portfolio.csv")
-    drop_cols = [c for c in ("effective_ticker",) if c in df.columns]
-    out = df.drop(columns=drop_cols)
     # Order columns: listed config columns first, then any extras.
-    ordered = [c for c in PROJECT_PORTFOLIO_COLUMNS if c in out.columns]
-    extras = [c for c in out.columns if c not in ordered]
-    out = out[ordered + extras]
+    ordered = [c for c in PROJECT_PORTFOLIO_COLUMNS if c in df.columns]
+    extras = [c for c in df.columns if c not in ordered]
+    out = df[ordered + extras]
     out.to_csv(out_path, index=False)
     print(f"Portfolio saved to {out_path}")
     return out_path

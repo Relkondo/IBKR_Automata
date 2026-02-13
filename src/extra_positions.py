@@ -19,8 +19,8 @@ from src.connection import suppress_errors
 from src.contracts import exchange_to_mic
 from src.exchange_hours import is_exchange_open
 from src.market_data import (
-    _snapshot_batch, _resolve_fx_rate, snap_to_tick,
-    SNAPSHOT_BATCH_SIZE, FILL_PATIENCE,
+    _snapshot_batch, _calc_limit_price, _resolve_fx_rate, snap_to_tick,
+    SNAPSHOT_BATCH_SIZE,
 )
 
 
@@ -299,27 +299,9 @@ def reconcile_extra_positions(
             "cancelled_orders": 0,
         }
 
-        # Compute limit price using FILL_PATIENCE spread formula.
-        limit_price = None
+        # Compute limit price using the shared spread-based formula.
         is_sell = existing > 0
-
-        if bid is not None and ask_val is not None:
-            spread = ask_val - bid
-            if spread >= 0:
-                if is_sell:
-                    limit_price = round(
-                        bid + spread * FILL_PATIENCE / 100, 2)
-                else:
-                    limit_price = round(
-                        ask_val - spread * FILL_PATIENCE / 100, 2)
-        elif last_val is not None and last_val > 0:
-            limit_price = round(last_val, 2)
-        elif close_val is not None and close_val > 0:
-            limit_price = round(close_val, 2)
-        elif bid is not None and bid > 0:
-            limit_price = round(bid, 2)
-        elif ask_val is not None and ask_val > 0:
-            limit_price = round(ask_val, 2)
+        limit_price = _calc_limit_price(row_dict, is_sell=is_sell)
 
         # Snap limit price to valid tick increment.
         if limit_price is not None:

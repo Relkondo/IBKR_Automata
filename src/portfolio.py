@@ -49,16 +49,6 @@ _OPT_TICKER_RE = re.compile(
     r"(?:\s+\S+)?$"                      # optional trailing suffix (e.g. Equity)
 )
 
-# Month number -> IBKR short month string (used later for secdef queries).
-# Accepts both zero-padded ("02") and unpadded ("2") keys.
-MONTH_MAP = {
-    "1": "JAN", "01": "JAN", "2": "FEB", "02": "FEB",
-    "3": "MAR", "03": "MAR", "4": "APR", "04": "APR",
-    "5": "MAY", "05": "MAY", "6": "JUN", "06": "JUN",
-    "7": "JUL", "07": "JUL", "8": "AUG", "08": "AUG",
-    "9": "SEP", "09": "SEP", "10": "OCT", "11": "NOV", "12": "DEC",
-}
-
 
 def _is_option(row: pd.Series) -> bool:
     """Heuristic: the row represents an option contract."""
@@ -100,7 +90,7 @@ def load_portfolio(xlsx_path: str | None = None) -> pd.DataFrame:
     -------
     pd.DataFrame
         Filtered portfolio table with additional helper columns:
-        ``is_option``, ``effective_ticker``, ``clean_ticker``.
+        ``is_option`` and ``clean_ticker``.
     """
     path = xlsx_path or _latest_xlsx(ASSETS_DIR)
     print(f"Reading portfolio from {path} ...")
@@ -123,8 +113,9 @@ def load_portfolio(xlsx_path: str | None = None) -> pd.DataFrame:
 
     # Derived columns.
     df["is_option"] = df.apply(_is_option, axis=1)
-    df["effective_ticker"] = df.apply(_effective_ticker, axis=1)
-    df["clean_ticker"] = df["effective_ticker"].apply(_clean_ticker)
+    df["clean_ticker"] = df.apply(
+        lambda row: _clean_ticker(_effective_ticker(row)), axis=1,
+    )
 
     df.reset_index(drop=True, inplace=True)
     print(f"Loaded {len(df)} positions ({df['is_option'].sum()} options).")

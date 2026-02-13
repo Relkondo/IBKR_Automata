@@ -13,7 +13,7 @@ and ``cancelled_orders``.
 from __future__ import annotations
 
 import pandas as pd
-from ib_async import IB, Trade
+from ib_async import IB
 
 from src.connection import suppress_errors
 from src.exchange_hours import is_exchange_open
@@ -325,12 +325,13 @@ def reconcile(ib: IB,
               dry_run: bool = False) -> pd.DataFrame:
     """Compute net quantities and optionally cancel stale orders.
 
-    When *dry_run* is ``True``, no orders are cancelled and extra
-    positions are not processed — useful for read-only comparisons.
+    When *dry_run* is ``True``, no orders are cancelled — all pending
+    orders are counted as-is and extra positions produce synthetic rows
+    for read-only display.  Useful for comparisons.
 
     1. Cancel stale orders (skipped in dry-run).
     2. Compute net quantities using ``compute_net_quantities``.
-    3. Handle extra positions not in the input file (skipped in dry-run).
+    3. Handle extra IBKR positions not in the input file.
     """
     account_id = get_account_id(ib)
 

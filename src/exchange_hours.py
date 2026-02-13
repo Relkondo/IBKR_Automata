@@ -144,11 +144,6 @@ def is_exchange_open(mic: str) -> bool:
     return open_time <= now.time() <= close_time
 
 
-def get_open_mic_set() -> set[str]:
-    """Return the set of known MIC codes whose exchanges are currently open."""
-    return {mic for mic in EXCHANGE_HOURS if is_exchange_open(mic)}
-
-
 # ------------------------------------------------------------------
 # DataFrame filtering
 # ------------------------------------------------------------------
