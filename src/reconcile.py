@@ -12,9 +12,6 @@ and ``cancelled_orders``.
 
 from __future__ import annotations
 
-import math
-import time
-
 import pandas as pd
 from ib_async import IB, Trade
 
@@ -106,44 +103,89 @@ def _signed_order_qty(order: dict) -> float:
     return qty if order["side"] == "BUY" else -qty
 
 
-def reconcile(ib: IB,
-              df: pd.DataFrame,
-              all_exchanges: bool = True) -> pd.DataFrame:
-    """Compute net quantities and cancel stale orders.
+def compute_net_quantities(
+    df: pd.DataFrame,
+    positions: dict[int, float],
+    orders_by_conid: dict[int, list[dict]],
+) -> pd.DataFrame:
+    """Add ``existing_qty``, ``pending_qty``, ``target_qty``, and
+    ``net_quantity`` columns to *df*.
 
-    For each row with a valid ``conid`` and ``limit_price``:
-      1. existing_qty from IBKR positions.
-      2. pending_qty from open orders for the same conid.
-      3. Stale orders (different price) are cancelled.
-      4. target_qty = floor(|dollar_alloc * fx| / limit_price) with sign.
-      5. net_qty = target - existing - pending.
+    For each row with a valid ``conid`` and ``Qty``:
+      existing = positions[conid]
+      pending  = sum of signed remaining order quantities
+      target   = Qty (already in the DataFrame)
+      net      = target - existing - pending
+
+    Returns a copy of the DataFrame with the new columns.
     """
-    account_id = get_account_id(ib)
-
-    print("Fetching current IBKR positions ...")
-    positions, position_meta = _fetch_positions(ib)
-    print(f"  Found {len(positions)} positions.\n")
-
-    print("Fetching open orders ...")
-    open_orders = _fetch_open_orders(ib)
-    print(f"  Found {len(open_orders)} active open orders.\n")
-
-    orders_by_conid: dict[int, list[dict]] = {}
-    for o in open_orders:
-        orders_by_conid.setdefault(o["conid"], []).append(o)
-
-    # Price tolerances.
-    PRICE_TOL_PCT = 0.005
-    PRICE_TOL_PCT_ILLIQUID = 0.05
-    _ILLIQUID_MICS = {"XFRA", "OTCM"}
-
     existing_qtys: list[float | None] = []
     pending_qtys: list[float | None] = []
     target_qtys: list[int | None] = []
     net_qtys: list[int | None] = []
+
+    for _, row in df.iterrows():
+        conid_raw = row.get("conid")
+        qty_raw = row.get("Qty")
+
+        if pd.isna(conid_raw) or pd.isna(qty_raw):
+            existing_qtys.append(None)
+            pending_qtys.append(None)
+            target_qtys.append(None)
+            net_qtys.append(None)
+            continue
+
+        conid = int(conid_raw)
+        target = round(float(qty_raw))
+        existing = positions.get(conid, 0)
+
+        pending = 0.0
+        for order in orders_by_conid.get(conid, []):
+            pending += _signed_order_qty(order)
+
+        net = target - round(existing) - round(pending)
+
+        existing_qtys.append(existing)
+        pending_qtys.append(pending)
+        target_qtys.append(target)
+        net_qtys.append(net)
+
+    out = df.copy()
+    out["existing_qty"] = existing_qtys
+    out["pending_qty"] = pending_qtys
+    out["target_qty"] = target_qtys
+    out["net_quantity"] = net_qtys
+    return out
+
+
+def _cancel_stale_orders(
+    ib: IB,
+    df: pd.DataFrame,
+    orders_by_conid: dict[int, list[dict]],
+    all_exchanges: bool,
+) -> tuple[dict[int, list[dict]], list[int],
+           bool, bool, set[str], set[str]]:
+    """Cancel stale orders and return the remaining (non-cancelled) ones.
+
+    Returns
+    -------
+    remaining_orders : dict[int, list[dict]]
+        Orders grouped by conid, with cancelled ones removed.
+    cancelled_counts : list[int]
+        Per-row count of cancelled orders (aligned with *df*).
+    cancel_confirm_all, cancel_skip_all : bool
+    cancel_confirm_exchanges, cancel_skip_exchanges : set[str]
+    """
+    PRICE_TOL_PCT = 0.005
+    PRICE_TOL_PCT_ILLIQUID = 0.05
+    _ILLIQUID_MICS = {"XFRA", "OTCM"}
+
+    # Start with a copy — orders not touched by any row stay as-is.
+    remaining: dict[int, list[dict]] = {
+        cid: list(ords) for cid, ords in orders_by_conid.items()
+    }
     cancelled_counts: list[int] = []
 
-    # Consent tracking.
     cancel_confirm_all: bool = False
     cancel_skip_all: bool = False
     cancel_confirm_exchanges: set[str] = set()
@@ -152,50 +194,19 @@ def reconcile(ib: IB,
     total = len(df)
     for idx, row in df.iterrows():
         conid_raw = row.get("conid")
-        limit_price = row.get("limit_price")
-        dollar_alloc = row.get("Dollar Allocation")
+        limit_price_raw = row.get("limit_price")
 
-        if pd.isna(conid_raw) or pd.isna(limit_price) or pd.isna(dollar_alloc):
-            existing_qtys.append(None)
-            pending_qtys.append(None)
-            target_qtys.append(None)
-            net_qtys.append(None)
+        if pd.isna(conid_raw) or pd.isna(limit_price_raw):
             cancelled_counts.append(0)
             continue
 
         conid = int(conid_raw)
-        limit_price = float(limit_price)
-        dollar_alloc = float(dollar_alloc)
+        limit_price = float(limit_price_raw)
+        conid_orders = orders_by_conid.get(conid, [])
 
-        ccy = row.get("currency")
-        fx_raw = row.get("fx_rate")
-        is_usd = pd.isna(ccy) or str(ccy).upper() == "USD"
-        if is_usd:
-            fx = 1.0
-        elif pd.notna(fx_raw) and float(fx_raw) > 0:
-            fx = float(fx_raw)
-        else:
-            existing_qtys.append(None)
-            pending_qtys.append(None)
-            target_qtys.append(None)
-            net_qtys.append(None)
+        if not conid_orders:
             cancelled_counts.append(0)
             continue
-
-        # Target quantity.
-        if limit_price > 0:
-            local_alloc = abs(dollar_alloc) * fx
-            target = math.floor(local_alloc / limit_price)
-            target = target if dollar_alloc >= 0 else -target
-        else:
-            target = 0
-
-        existing = positions.get(conid, 0)
-
-        # Pending orders (cancel stale ones).
-        pending = 0
-        cancelled = 0
-        conid_orders = orders_by_conid.get(conid, [])
 
         mic = row.get("MIC Primary Exchange")
         can_cancel = all_exchanges
@@ -207,18 +218,22 @@ def reconcile(ib: IB,
                    if mic_str in _ILLIQUID_MICS
                    else PRICE_TOL_PCT)
 
+        kept: list[dict] = []
+        cancelled = 0
+
         for order in conid_orders:
             order_price = order.get("price")
             price_diff_pct = (abs(order_price - limit_price) / limit_price
                               if order_price is not None and limit_price
                               else None)
+
             if price_diff_pct is not None and price_diff_pct > tol_pct:
                 if not can_cancel:
                     name = row.get("Name", "")
                     print(f"  [{idx + 1}/{total}] Stale order "
                           f"{order['orderId']} for '{name}' kept "
                           f"(exchange {mic_str} closed)")
-                    pending += _signed_order_qty(order)
+                    kept.append(order)
                     continue
 
                 name = row.get("Name", "")
@@ -227,7 +242,7 @@ def reconcile(ib: IB,
                     print(f"  [{idx + 1}/{total}] Stale order "
                           f"{order['orderId']} for '{name}' skipped "
                           f"(auto-skip)")
-                    pending += _signed_order_qty(order)
+                    kept.append(order)
                     continue
 
                 auto = (cancel_confirm_all
@@ -253,17 +268,17 @@ def reconcile(ib: IB,
                         cancel_confirm_exchanges.add(mic_str)
                     elif choice == "X":
                         cancel_skip_exchanges.add(mic_str)
-                        pending += _signed_order_qty(order)
+                        kept.append(order)
                         continue
                     elif choice == "N":
                         cancel_skip_all = True
-                        pending += _signed_order_qty(order)
+                        kept.append(order)
                         continue
                     elif choice == "S":
-                        pending += _signed_order_qty(order)
+                        kept.append(order)
                         continue
                     elif choice != "Y":
-                        pending += _signed_order_qty(order)
+                        kept.append(order)
                         continue
 
                 # Cancel the stale order via ib_async.
@@ -281,23 +296,59 @@ def reconcile(ib: IB,
                 except Exception as exc:
                     print(f"  [!] Failed to cancel order "
                           f"{order['orderId']}: {exc}")
-                    pending += _signed_order_qty(order)
+                    kept.append(order)
             else:
-                pending += _signed_order_qty(order)
+                kept.append(order)
 
-        net = target - int(existing) - int(pending)
-
-        existing_qtys.append(existing)
-        pending_qtys.append(pending)
-        target_qtys.append(target)
-        net_qtys.append(net)
+        remaining[conid] = kept
         cancelled_counts.append(cancelled)
 
-    df = df.copy()
-    df["existing_qty"] = existing_qtys
-    df["pending_qty"] = pending_qtys
-    df["target_qty"] = target_qtys
-    df["net_quantity"] = net_qtys
+    return (remaining, cancelled_counts,
+            cancel_confirm_all, cancel_skip_all,
+            cancel_confirm_exchanges, cancel_skip_exchanges)
+
+
+def reconcile(ib: IB,
+              df: pd.DataFrame,
+              all_exchanges: bool = True,
+              dry_run: bool = False) -> pd.DataFrame:
+    """Compute net quantities and optionally cancel stale orders.
+
+    When *dry_run* is ``True``, no orders are cancelled and extra
+    positions are not processed — useful for read-only comparisons.
+
+    1. Cancel stale orders (skipped in dry-run).
+    2. Compute net quantities using ``compute_net_quantities``.
+    3. Handle extra positions not in the input file (skipped in dry-run).
+    """
+    account_id = get_account_id(ib)
+
+    print("Fetching current IBKR positions ...")
+    positions, position_meta = _fetch_positions(ib)
+    print(f"  Found {len(positions)} positions.\n")
+
+    print("Fetching open orders ...")
+    open_orders = _fetch_open_orders(ib)
+    print(f"  Found {len(open_orders)} active open orders.\n")
+
+    orders_by_conid: dict[int, list[dict]] = {}
+    for o in open_orders:
+        orders_by_conid.setdefault(o["conid"], []).append(o)
+
+    if dry_run:
+        # Read-only: skip cancellation, count all orders as pending.
+        df = compute_net_quantities(df, positions, orders_by_conid)
+        df["cancelled_orders"] = 0
+        return df
+
+    # Phase 1: Cancel stale orders.
+    (remaining_orders, cancelled_counts,
+     cancel_confirm_all, cancel_skip_all,
+     cancel_confirm_exchanges, cancel_skip_exchanges,
+     ) = _cancel_stale_orders(ib, df, orders_by_conid, all_exchanges)
+
+    # Phase 2: Compute net quantities with remaining (non-cancelled) orders.
+    df = compute_net_quantities(df, positions, remaining_orders)
     df["cancelled_orders"] = cancelled_counts
 
     # ------------------------------------------------------------------

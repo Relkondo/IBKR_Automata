@@ -120,7 +120,7 @@ def _result_from(cd, eff_mic: str | None = None):
     c = cd.contract
     return c.conId, cd.longName, c.symbol, (
         eff_mic or exchange_to_mic(c.primaryExchange or "")
-    )
+    ), (c.currency or "USD")
 
 
 def _query_on_exchanges(ib: IB, symbol: str, mic: str | None) -> list:
@@ -323,7 +323,7 @@ def _resolve_option(
         opt_details[0].longName
         or f"{c.symbol} {c.lastTradeDateOrContractMonth} {right}{strike}"
     )
-    return c.conId, desc, c.symbol, mic
+    return c.conId, desc, c.symbol, mic, (c.currency or "USD")
 
 
 # ---------------------------------------------------------------------------
@@ -341,6 +341,7 @@ def resolve_conids(ib: IB, df: pd.DataFrame) -> pd.DataFrame:
     api_names: list[str | None] = []
     api_tickers: list[str | None] = []
     eff_mics: list[str | None] = []
+    currencies: list[str | None] = []
     total = len(df)
 
     for idx, row in df.iterrows():
@@ -360,16 +361,18 @@ def resolve_conids(ib: IB, df: pd.DataFrame) -> pd.DataFrame:
             result = _resolve_stock(ib, symbol, mic, name)
 
         if result:
-            cid, r_name, r_sym, eff = result
+            cid, r_name, r_sym, eff, ccy = result
             conids.append(cid)
             api_names.append(r_name)
             api_tickers.append(r_sym)
             eff_mics.append(eff)
+            currencies.append(ccy)
         else:
             conids.append(None)
             api_names.append(None)
             api_tickers.append(None)
             eff_mics.append(mic)
+            currencies.append(None)
             print(f"    [!] FAILED to resolve '{symbol}'")
 
         time.sleep(0.05)
@@ -378,6 +381,7 @@ def resolve_conids(ib: IB, df: pd.DataFrame) -> pd.DataFrame:
     df["IBKR Name"] = api_names
     df["IBKR Ticker"] = api_tickers
     df["MIC Primary Exchange"] = eff_mics
+    df["currency"] = currencies
 
     # Flag rows where the portfolio name differs from what IBKR returned.
     def _names_differ(row):

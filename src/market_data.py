@@ -1,33 +1,34 @@
 """Fetch market-data snapshots and compute limit prices via ib_async.
 
-Uses ``ib.reqMktData(snapshot=True)`` for price data and ``Forex()``
-contracts for exchange rates.
+Uses ``ib.reqTickers()`` for efficient batch snapshot requests and
+``Forex()`` contracts for exchange rates.
 
-Fields used: bid, ask, marketPrice (mark), high (day high), low (day low).
+Fields used: bid, ask, last, close, high (day), low (day).
 
-Limit-price formula uses a SPEED_VS_GREED parameter that controls how
-aggressively we undercut/overcut the reference price.
+Limit-price formula uses a FILL_PATIENCE parameter (0-100) that
+controls how aggressively we cross the bid/ask spread:
+  0   = cross the spread fully (fills immediately)
+  50  = midpoint (balanced)
+  100 = sit on the passive side (cheapest, may not fill)
 """
 
 import math
 import os
 
 import pandas as pd
-from ib_async import IB, Contract, Forex, Ticker as IbTicker
+from ib_async import IB, Contract, Forex
 
 from src.config import OUTPUT_DIR
 
 # ------------------------------------------------------------------
-# Polling parameters
+# Snapshot batching
 # ------------------------------------------------------------------
-BATCH_SIZE = 50
-POLL_DELAY_SECONDS = 2
-MAX_POLLS = 5
+SNAPSHOT_BATCH_SIZE = 50
 
 # ------------------------------------------------------------------
 # Limit-price tuning
 # ------------------------------------------------------------------
-SPEED_VS_GREED = 20
+FILL_PATIENCE = 50  # 0 = cross spread immediately, 100 = sit on bid/ask
 
 
 # ------------------------------------------------------------------
@@ -47,98 +48,50 @@ def _safe_float(val) -> float | None:
         return None
 
 
-def _poll_snapshot(ib: IB, contracts: list[Contract],
-                   ) -> dict[int, dict]:
-    """Request snapshot market data for a batch of contracts.
+def _snapshot_batch(
+    ib: IB, contracts: list[Contract],
+) -> dict[int, dict]:
+    """Request snapshot tickers for a batch of contracts.
 
-    TWS returns live data when a subscription exists, or delayed data
-    otherwise (market data type 3 is set at connection time).  We poll
-    with adaptive early-exit logic (up to MAX_POLLS rounds).
+    Uses ``ib.reqTickers()`` which is blocking and returns when all
+    snapshots are ready.  No manual polling needed.
 
-    Returns a dict ``{conid: {bid, ask, mark, high, low}}``.
+    Returns ``{conid: {bid, ask, last, close, high, low}}``.
     """
     if not contracts:
         return {}
 
     result: dict[int, dict] = {}
-    tickers: list[IbTicker] = []
 
-    # Request snapshots for all contracts.
-    for c in contracts:
-        try:
-            t = ib.reqMktData(c, genericTickList="",
-                              snapshot=True, regulatorySnapshot=False)
-            tickers.append(t)
-        except Exception as exc:
-            print(f"  [!] reqMktData failed for conid {c.conId}: {exc}")
+    try:
+        tickers = ib.reqTickers(*contracts)
+    except Exception as exc:
+        print(f"  [!] reqTickers failed: {exc}")
+        return result
 
-    # Allow initial data to arrive.
-    ib.sleep(POLL_DELAY_SECONDS)
+    for t in tickers:
+        if not t.contract:
+            continue
+        cid = t.contract.conId
+        bid = _safe_float(t.bid)
+        ask = _safe_float(t.ask)
+        last = _safe_float(t.last)
+        close = _safe_float(t.close)
+        high = _safe_float(t.high)
+        low = _safe_float(t.low)
 
-    conid_map = {t.contract.conId: t for t in tickers if t.contract}
+        result[cid] = {
+            "bid": bid, "ask": ask,
+            "last": last, "close": close,
+            "high": high, "low": low,
+        }
 
-    for attempt in range(1, MAX_POLLS + 1):
-        for cid, t in conid_map.items():
-            bid = _safe_float(t.bid)
-            ask = _safe_float(t.ask)
-            mark = _safe_float(t.marketPrice())
-            high = _safe_float(t.high)
-            low = _safe_float(t.low)
-
-            if attempt == 1:
-                print(f"    conid={cid}: bid={bid!r}, ask={ask!r}, "
-                      f"mark={mark!r}, high={high!r}, low={low!r}")
-
-            if cid not in result:
-                result[cid] = {
-                    "bid": None, "ask": None,
-                    "mark": None, "high": None, "low": None,
-                }
-            rec = result[cid]
-            if bid is not None:
-                rec["bid"] = bid
-            if ask is not None:
-                rec["ask"] = ask
-            if mark is not None:
-                rec["mark"] = mark
-            if high is not None:
-                rec["high"] = high
-            if low is not None:
-                rec["low"] = low
-
-        n_with_data = sum(
-            1 for r in result.values()
-            if any(v is not None for v in r.values())
-        )
-        print(f"  Poll {attempt}/{MAX_POLLS}: "
-              f"{n_with_data}/{len(contracts)} conids with some data")
-
-        # Adaptive early-exit.
-        if attempt >= 2:
-            all_have_range = all(
-                (r["bid"] is not None and r["ask"] is not None)
-                or (r["high"] is not None and r["low"] is not None)
-                for r in result.values()
-            ) if result else False
-            if all_have_range and len(result) == len(contracts):
-                print("  -> All conids have bid/ask or high/low. Stopping.")
-                break
-
-        if attempt >= 3:
-            all_have_mark = all(
-                r["mark"] is not None for r in result.values()
-            ) if result else False
-            if all_have_mark and len(result) == len(contracts):
-                print("  -> All conids have mark price. Stopping.")
-                break
-
-        if attempt < MAX_POLLS:
-            ib.sleep(POLL_DELAY_SECONDS)
-
-    no_data = len(contracts) - len(result)
-    if no_data > 0:
-        print(f"  [!] {no_data} conids got no data after "
-              f"{MAX_POLLS} polls.")
+    n_with_ba = sum(
+        1 for r in result.values()
+        if r["bid"] is not None and r["ask"] is not None
+    )
+    print(f"    {n_with_ba}/{len(contracts)} with bid/ask, "
+          f"{len(result)}/{len(contracts)} with any data")
 
     return result
 
@@ -150,48 +103,54 @@ def _poll_snapshot(ib: IB, contracts: list[Contract],
 def _calc_limit_price(row) -> float | None:
     """Compute the limit price for a single row.
 
-    BUY formula (Dollar Allocation >= 0):
-      1. If bid available:  bid - (mark - bid) / SPEED_VS_GREED
-      2. Elif day_low available: mark - (mark - day_low) / SPEED_VS_GREED
-      3. Else: mark
+    Uses a spread-based formula controlled by ``FILL_PATIENCE`` (0-100):
 
-    SELL formula (Dollar Allocation < 0):
-      1. If ask available:  ask - (mark - ask) / SPEED_VS_GREED
-      2. Elif day_high available: mark - (mark - day_high) / SPEED_VS_GREED
-      3. Else: mark
+    BUY  (Dollar Allocation >= 0):
+      limit = ask - (ask - bid) * FILL_PATIENCE / 100
+        0   → buy at ask  (aggressive, fills fast)
+        50  → buy at midpoint
+        100 → buy at bid  (patient, may not fill)
+
+    SELL (Dollar Allocation < 0):
+      limit = bid + (ask - bid) * FILL_PATIENCE / 100
+        0   → sell at bid (aggressive, fills fast)
+        50  → sell at midpoint
+        100 → sell at ask (patient, may not fill)
+
+    Fallbacks when bid/ask unavailable: ``last``, then ``close``.
     """
-    mark = row.get("mark")
     bid = row.get("bid")
     ask = row.get("ask")
-    high = row.get("day_high")
-    low = row.get("day_low")
-
-    if pd.isna(mark) and pd.isna(bid) and pd.isna(ask):
-        return None
+    last = row.get("last")
+    close = row.get("close")
 
     dollar_alloc = row.get("Dollar Allocation")
     is_sell = pd.notna(dollar_alloc) and float(dollar_alloc) < 0
 
-    if is_sell:
-        if pd.notna(ask) and pd.notna(mark):
-            return round(ask - (mark - ask) / SPEED_VS_GREED, 2)
-        if pd.notna(high) and pd.notna(mark):
-            return round(mark - (mark - high) / SPEED_VS_GREED, 2)
-        if pd.notna(mark):
-            return round(mark, 2)
-        if pd.notna(ask):
-            return round(ask, 2)
-        return None
-    else:
-        if pd.notna(bid) and pd.notna(mark):
-            return round(bid - (mark - bid) / SPEED_VS_GREED, 2)
-        if pd.notna(low) and pd.notna(mark):
-            return round(mark - (mark - low) / SPEED_VS_GREED, 2)
-        if pd.notna(mark):
-            return round(mark, 2)
-        if pd.notna(bid):
-            return round(bid, 2)
-        return None
+    # Primary: spread-based formula when both bid and ask exist.
+    if pd.notna(bid) and pd.notna(ask):
+        spread = float(ask) - float(bid)
+        if spread >= 0:
+            if is_sell:
+                return round(float(bid) + spread * FILL_PATIENCE / 100, 2)
+            else:
+                return round(float(ask) - spread * FILL_PATIENCE / 100, 2)
+
+    # Fallback 1: last traded price.
+    if pd.notna(last) and float(last) > 0:
+        return round(float(last), 2)
+
+    # Fallback 2: close price.
+    if pd.notna(close) and float(close) > 0:
+        return round(float(close), 2)
+
+    # Fallback 3: any available price.
+    if pd.notna(bid) and float(bid) > 0:
+        return round(float(bid), 2)
+    if pd.notna(ask) and float(ask) > 0:
+        return round(float(ask), 2)
+
+    return None
 
 
 # ------------------------------------------------------------------
@@ -274,60 +233,48 @@ def _resolve_fx_rate(ib: IB, ccy: str) -> float | None:
 
 
 def resolve_currencies(ib: IB, df: pd.DataFrame) -> pd.DataFrame:
-    """Add ``currency`` and ``fx_rate`` columns to the portfolio table.
+    """Add ``fx_rate`` column to the portfolio table.
 
-    Uses ``ib.reqContractDetails()`` to fetch the trading currency for
-    each contract, and ``Forex()`` snapshots for exchange rates.
+    Reads the ``currency`` column (populated by ``resolve_conids``)
+    and fetches exchange rates for unique non-USD currencies via
+    Forex snapshots.
     """
-    valid = df[df["conid"].notna()].copy()
-    all_conids = valid["conid"].astype(int).tolist()
-
-    if not all_conids:
+    if "currency" not in df.columns:
         df["currency"] = None
         df["fx_rate"] = None
         return df
 
-    print(f"Resolving currencies for {len(all_conids)} contracts ...")
+    # Collect unique non-USD currencies from the DataFrame.
+    valid_currencies = df.loc[df["currency"].notna(), "currency"].unique()
+    unique_currencies = {
+        str(c).upper() for c in valid_currencies
+    } - {"USD"}
 
-    # Build Contract objects from conids and ask for details.
-    cid_to_currency: dict[int, str] = {}
-    for cid in all_conids:
-        c = Contract(conId=cid)
-        try:
-            details = ib.reqContractDetails(c)
-            if details:
-                ccy = details[0].contract.currency
-                if ccy:
-                    cid_to_currency[cid] = ccy.upper()
-        except Exception as exc:
-            print(f"  [!] Currency fetch failed for conid {cid}: {exc}")
-        ib.sleep(0.05)
+    if not unique_currencies:
+        df["fx_rate"] = df["currency"].apply(
+            lambda c: 1.0 if pd.notna(c) and str(c).upper() == "USD" else None
+        )
+        print("  No foreign currencies to resolve.\n")
+        return df
 
-    # Fetch exchange rates for unique non-USD currencies.
-    unique_currencies = set(cid_to_currency.values()) - {"USD"}
+    print(f"Resolving exchange rates for {len(unique_currencies)} "
+          f"currencies: {', '.join(sorted(unique_currencies))} ...")
+
     fx_rates: dict[str, float] = {"USD": 1.0}
     for ccy in sorted(unique_currencies):
         resolved = _resolve_fx_rate(ib, ccy)
         if resolved is not None:
             fx_rates[ccy] = resolved
 
-    # Map back to the DataFrame.
-    currencies: list[str | None] = []
-    rates: list[float | None] = []
-    for _, row in df.iterrows():
-        cid = row.get("conid")
-        if pd.notna(cid) and int(cid) in cid_to_currency:
-            ccy = cid_to_currency[int(cid)]
-            currencies.append(ccy)
-            rates.append(fx_rates.get(ccy))
-        else:
-            currencies.append(None)
-            rates.append(None)
+    # Map rates back to each row.
+    df["fx_rate"] = df["currency"].apply(
+        lambda c: fx_rates.get(str(c).upper()) if pd.notna(c) else None
+    )
 
-    df["currency"] = currencies
-    df["fx_rate"] = rates
-
-    n_foreign = sum(1 for c in currencies if c is not None and c != "USD")
+    n_foreign = (
+        df["currency"].notna()
+        & (df["currency"].astype(str).str.upper() != "USD")
+    ).sum()
     print(f"  {n_foreign} foreign-currency positions identified.\n")
     return df
 
@@ -339,66 +286,72 @@ def resolve_currencies(ib: IB, df: pd.DataFrame) -> pd.DataFrame:
 def fetch_market_data(ib: IB, df: pd.DataFrame) -> pd.DataFrame:
     """Populate market-data columns and compute limit prices.
 
+    Builds ``Contract`` objects from the ``conid`` column, qualifies
+    them in bulk via ``ib.qualifyContracts()``, then fetches snapshots
+    using ``ib.reqTickers()`` (batched for safety).
+
     Only rows with a valid (non-null) conid are queried.
     """
-    valid = df[df["conid"].notna()].copy()
-    all_conids = valid["conid"].astype(int).tolist()
+    all_conids = (
+        df.loc[df["conid"].notna(), "conid"].astype(int).tolist()
+    )
 
     if not all_conids:
         print("No valid conids to fetch market data for.")
-        for col in ("bid", "ask", "mark", "day_high", "day_low", "limit_price"):
+        for col in ("bid", "ask", "last", "close",
+                     "day_high", "day_low", "limit_price"):
             df[col] = None
         return df
 
     print(f"Fetching market data for {len(all_conids)} contracts ...")
 
-    # Build a Contract for each conid.
-    conid_to_contract: dict[int, Contract] = {}
-    for cid in all_conids:
-        c = Contract(conId=cid)
-        try:
-            details = ib.reqContractDetails(c)
-            if details:
-                conid_to_contract[cid] = details[0].contract
-            else:
-                conid_to_contract[cid] = c
-        except Exception:
-            conid_to_contract[cid] = c
-        ib.sleep(0.02)
+    # Build Contract stubs from conid and qualify in bulk.
+    contracts = [Contract(conId=cid) for cid in all_conids]
+    qualified = ib.qualifyContracts(*contracts)
+    print(f"  Qualified {len(qualified)}/{len(all_conids)} contracts")
 
+    # Map conid -> qualified contract (fallback to stub if needed).
+    cid_to_contract: dict[int, Contract] = {
+        c.conId: c for c in qualified if c.conId
+    }
+    contracts_list = [cid_to_contract[cid] for cid in all_conids
+                      if cid in cid_to_contract]
+
+    # Fetch snapshots in batches via reqTickers.
     snapshot: dict[int, dict] = {}
-
-    # Process in batches.
-    contracts_list = [conid_to_contract[cid] for cid in all_conids
-                      if cid in conid_to_contract]
-    for i in range(0, len(contracts_list), BATCH_SIZE):
-        batch = contracts_list[i : i + BATCH_SIZE]
-        print(f"\n  Batch {i // BATCH_SIZE + 1} "
-              f"({len(batch)} conids) ...")
-        batch_result = _poll_snapshot(ib, batch)
+    total_batches = math.ceil(len(contracts_list) / SNAPSHOT_BATCH_SIZE)
+    for i in range(0, len(contracts_list), SNAPSHOT_BATCH_SIZE):
+        batch = contracts_list[i : i + SNAPSHOT_BATCH_SIZE]
+        batch_num = i // SNAPSHOT_BATCH_SIZE + 1
+        print(f"  Batch {batch_num}/{total_batches} "
+              f"({len(batch)} contracts) …")
+        batch_result = _snapshot_batch(ib, batch)
         snapshot.update(batch_result)
 
-    # Map back to the DataFrame.
-    bids, asks, marks, highs, lows = [], [], [], [], []
+    # Map results back to the DataFrame.
+    bids, asks, lasts, closes, highs, lows = [], [], [], [], [], []
     for _, row in df.iterrows():
         cid = row.get("conid")
         if pd.notna(cid) and int(cid) in snapshot:
             entry = snapshot[int(cid)]
             bids.append(entry["bid"])
             asks.append(entry["ask"])
-            marks.append(entry["mark"])
+            lasts.append(entry["last"])
+            closes.append(entry["close"])
             highs.append(entry["high"])
             lows.append(entry["low"])
         else:
             bids.append(None)
             asks.append(None)
-            marks.append(None)
+            lasts.append(None)
+            closes.append(None)
             highs.append(None)
             lows.append(None)
 
     df["bid"] = bids
     df["ask"] = asks
-    df["mark"] = marks
+    df["last"] = lasts
+    df["close"] = closes
     df["day_high"] = highs
     df["day_low"] = lows
 
@@ -438,11 +391,11 @@ def fetch_market_data(ib: IB, df: pd.DataFrame) -> pd.DataFrame:
     )
 
     got_bid = df["bid"].notna().sum()
-    got_mark = df["mark"].notna().sum()
+    got_last = df["last"].notna().sum()
     got_limit = df["limit_price"].notna().sum()
     print(f"\nMarket data summary:")
     print(f"  Bid/Ask received : {got_bid}/{len(all_conids)}")
-    print(f"  Mark received    : {got_mark}/{len(all_conids)}")
+    print(f"  Last received    : {got_last}/{len(all_conids)}")
     print(f"  Limit price set  : {got_limit}/{len(all_conids)}\n")
     return df
 

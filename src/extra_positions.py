@@ -9,12 +9,16 @@ cover) those positions.
 
 from __future__ import annotations
 
+import math
+
 import pandas as pd
-from ib_async import IB, Contract, Forex
+from ib_async import IB, Contract
 
 from src.contracts import exchange_to_mic
 from src.exchange_hours import is_exchange_open
-from src.market_data import _poll_snapshot, _safe_float, BATCH_SIZE, SPEED_VS_GREED
+from src.market_data import (
+    _snapshot_batch, _resolve_fx_rate, SNAPSHOT_BATCH_SIZE, FILL_PATIENCE,
+)
 
 
 # ------------------------------------------------------------------
@@ -47,69 +51,58 @@ def reconcile_extra_positions(
     print(f"\nFound {len(extra_conids)} IBKR position(s) not in the "
           f"input file. Fetching market data to prepare sell orders ...")
 
-    # --- Fetch currency info for extra conids --------------------------
+    # --- Qualify contracts and extract currencies -----------------------
+    extra_contracts = [Contract(conId=cid) for cid in extra_conids]
+    qualified = ib.qualifyContracts(*extra_contracts)
+    cid_to_contract = {c.conId: c for c in qualified if c.conId}
+
     extra_currencies: dict[int, str] = {}
-    extra_fx: dict[int, float] = {}
     for cid in extra_conids:
-        c = Contract(conId=cid)
-        try:
-            details = ib.reqContractDetails(c)
-            if details:
-                ccy = details[0].contract.currency or "USD"
-                extra_currencies[cid] = ccy.upper()
-        except Exception as exc:
-            print(f"  [!] Could not fetch details for conid {cid}: {exc}")
-        ib.sleep(0.02)
+        qc = cid_to_contract.get(cid)
+        if qc and qc.currency:
+            extra_currencies[cid] = qc.currency.upper()
+        else:
+            extra_currencies[cid] = "USD"
 
     # Fetch exchange rates for unique non-USD currencies.
-    unique_ccys = set(c for c in extra_currencies.values() if c != "USD")
-    fx_rates: dict[str, float] = {}
-    for ccy in unique_ccys:
-        try:
-            pair = f"{ccy}USD"
-            fx_contract = Forex(pair)
-            ib.qualifyContracts(fx_contract)
-            t = ib.reqMktData(fx_contract, snapshot=True)
-            ib.sleep(2)
-            rate = _safe_float(t.marketPrice())
-            ib.cancelMktData(fx_contract)
-            if rate and rate > 0:
-                fx_rates[ccy] = round(1.0 / rate, 6)
-            else:
-                print(f"  [!] Could not get FX rate for USD->{ccy}")
-        except Exception as exc:
-            print(f"  [!] FX rate fetch failed for {ccy}: {exc}")
+    unique_ccys = {c for c in extra_currencies.values() if c != "USD"}
+    fx_rates: dict[str, float] = {"USD": 1.0}
+    for ccy in sorted(unique_ccys):
+        resolved = _resolve_fx_rate(ib, ccy)
+        if resolved is not None:
+            fx_rates[ccy] = resolved
 
+    extra_fx: dict[int, float] = {}
     for cid in extra_conids:
         ccy = extra_currencies.get(cid, "USD")
-        if ccy == "USD":
-            extra_fx[cid] = 1.0
-        elif ccy in fx_rates:
+        if ccy in fx_rates:
             extra_fx[cid] = fx_rates[ccy]
 
     # --- Fetch market data for extra conids ----------------------------
-    # Build Contract objects.
-    extra_contracts: list[Contract] = []
-    for cid in extra_conids:
-        c = Contract(conId=cid)
-        try:
-            details = ib.reqContractDetails(c)
-            if details:
-                extra_contracts.append(details[0].contract)
-            else:
-                extra_contracts.append(c)
-        except Exception:
-            extra_contracts.append(c)
-        ib.sleep(0.02)
+    contracts_list = [cid_to_contract[cid] for cid in extra_conids
+                      if cid in cid_to_contract]
 
     snapshot: dict[int, dict] = {}
-    for i in range(0, len(extra_contracts), BATCH_SIZE):
-        batch = extra_contracts[i : i + BATCH_SIZE]
-        batch_result = _poll_snapshot(ib, batch)
+    total_batches = math.ceil(len(contracts_list) / SNAPSHOT_BATCH_SIZE) if contracts_list else 0
+    for i in range(0, len(contracts_list), SNAPSHOT_BATCH_SIZE):
+        batch = contracts_list[i : i + SNAPSHOT_BATCH_SIZE]
+        batch_num = i // SNAPSHOT_BATCH_SIZE + 1
+        print(f"  Extra batch {batch_num}/{total_batches} "
+              f"({len(batch)} contracts) …")
+        batch_result = _snapshot_batch(ib, batch)
         snapshot.update(batch_result)
 
-    # --- Cancel stale open orders on extra conids ----------------------
+    # --- Cancel open orders on extra conids -----------------------------
+    # For extra positions the target is 0, so every order is stale.
+    # Track which orders are *kept* (not cancelled) so their signed
+    # quantity can be subtracted from net_quantity later.
     extra_cancelled = 0
+    pending_by_conid: dict[int, float] = {}
+
+    def _signed_qty(order: dict) -> float:
+        qty = order["remainingQuantity"]
+        return qty if order["side"] == "BUY" else -qty
+
     for cid in extra_conids:
         conid_orders = orders_by_conid.get(cid, [])
         pm = position_meta.get(cid, {})
@@ -126,12 +119,16 @@ def reconcile_extra_positions(
                 print(f"  Extra-position stale order "
                       f"{order['orderId']} for '{pos_name}' kept "
                       f"(exchange {mic_code} closed)")
+                pending_by_conid[cid] = (
+                    pending_by_conid.get(cid, 0) + _signed_qty(order))
                 continue
 
             if cancel_skip_all or mic_code in cancel_skip_exchanges:
                 print(f"  Extra-position stale order "
                       f"{order['orderId']} for '{pos_name}' skipped "
                       f"(auto-skip)")
+                pending_by_conid[cid] = (
+                    pending_by_conid.get(cid, 0) + _signed_qty(order))
                 continue
 
             auto = (cancel_confirm_all
@@ -155,14 +152,22 @@ def reconcile_extra_positions(
                     cancel_confirm_exchanges.add(mic_code)
                 elif choice == "X":
                     cancel_skip_exchanges.add(mic_code)
+                    pending_by_conid[cid] = (
+                        pending_by_conid.get(cid, 0) + _signed_qty(order))
                     continue
                 elif choice == "N":
                     cancel_skip_all = True
+                    pending_by_conid[cid] = (
+                        pending_by_conid.get(cid, 0) + _signed_qty(order))
                     continue
                 elif choice == "S":
+                    pending_by_conid[cid] = (
+                        pending_by_conid.get(cid, 0) + _signed_qty(order))
                     continue
                 elif choice != "Y":
                     print(f"    Invalid choice, skipping.")
+                    pending_by_conid[cid] = (
+                        pending_by_conid.get(cid, 0) + _signed_qty(order))
                     continue
 
             try:
@@ -177,11 +182,15 @@ def reconcile_extra_positions(
             except Exception as exc:
                 print(f"  [!] Failed to cancel order "
                       f"{order['orderId']}: {exc}")
+                # Cancellation failed — order stays, count as pending.
+                pending_by_conid[cid] = (
+                    pending_by_conid.get(cid, 0) + _signed_qty(order))
 
     # --- Build synthetic rows ------------------------------------------
     extra_rows: list[dict] = []
     for cid in extra_conids:
         existing = positions.get(cid, 0)
+        pending = pending_by_conid.get(cid, 0)
         if existing == 0:
             continue
 
@@ -194,7 +203,8 @@ def reconcile_extra_positions(
         snap = snapshot.get(cid, {})
         bid = snap.get("bid")
         ask_val = snap.get("ask")
-        mark_val = snap.get("mark")
+        last_val = snap.get("last")
+        close_val = snap.get("close")
         high_val = snap.get("high")
         low_val = snap.get("low")
 
@@ -210,45 +220,41 @@ def reconcile_extra_positions(
             "Dollar Allocation": 0.0,
             "bid": bid,
             "ask": ask_val,
-            "mark": mark_val,
+            "last": last_val,
+            "close": close_val,
             "day_high": high_val,
             "day_low": low_val,
             "is_option": False,
             "existing_qty": existing,
-            "pending_qty": 0,
+            "pending_qty": pending,
             "target_qty": 0,
             "cancelled_orders": 0,
         }
 
-        # Compute limit price.
+        # Compute limit price using FILL_PATIENCE spread formula.
         limit_price = None
-        if existing > 0:
-            # SELL formula.
-            if mark_val is not None and ask_val is not None:
-                limit_price = round(
-                    ask_val - (mark_val - ask_val) / SPEED_VS_GREED, 2)
-            elif mark_val is not None and high_val is not None:
-                limit_price = round(
-                    mark_val - (mark_val - high_val) / SPEED_VS_GREED, 2)
-            elif mark_val is not None:
-                limit_price = round(mark_val, 2)
-            elif ask_val is not None:
-                limit_price = round(ask_val, 2)
-        else:
-            # BUY (cover) formula.
-            if mark_val is not None and bid is not None:
-                limit_price = round(
-                    bid - (mark_val - bid) / SPEED_VS_GREED, 2)
-            elif mark_val is not None and low_val is not None:
-                limit_price = round(
-                    mark_val - (mark_val - low_val) / SPEED_VS_GREED, 2)
-            elif mark_val is not None:
-                limit_price = round(mark_val, 2)
-            elif bid is not None:
-                limit_price = round(bid, 2)
+        is_sell = existing > 0
+
+        if bid is not None and ask_val is not None:
+            spread = ask_val - bid
+            if spread >= 0:
+                if is_sell:
+                    limit_price = round(
+                        bid + spread * FILL_PATIENCE / 100, 2)
+                else:
+                    limit_price = round(
+                        ask_val - spread * FILL_PATIENCE / 100, 2)
+        elif last_val is not None and last_val > 0:
+            limit_price = round(last_val, 2)
+        elif close_val is not None and close_val > 0:
+            limit_price = round(close_val, 2)
+        elif bid is not None and bid > 0:
+            limit_price = round(bid, 2)
+        elif ask_val is not None and ask_val > 0:
+            limit_price = round(ask_val, 2)
 
         row_dict["limit_price"] = limit_price
-        row_dict["net_quantity"] = 0 - int(existing)
+        row_dict["net_quantity"] = 0 - round(existing) - round(pending)
 
         extra_rows.append(row_dict)
 

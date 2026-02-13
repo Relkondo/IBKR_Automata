@@ -21,7 +21,7 @@ CLI arguments
   buy-all            Skip reconciliation – order the full Project_Portfolio
                      quantities regardless of existing IBKR positions.
   cancel-all-orders  Cancel every open order on the account and exit.
-  print-project-vs-actual
+  print-project-vs-current
                      Load Project_Portfolio.csv and current IBKR positions,
                      then output an Excel comparison to output/.
   -all-exchanges     Operate on all exchanges regardless of trading hours.
@@ -41,7 +41,7 @@ from src.contracts import resolve_conids
 from src.market_data import (
     fetch_market_data, resolve_currencies, save_project_portfolio,
 )
-from src.comparison import generate_project_vs_actual
+from src.comparison import generate_project_vs_current
 from src.exchange_hours import filter_df_by_open_exchange
 from src.orders import (
     cancel_all_orders, get_account_id, run_order_loop, print_order_summary,
@@ -69,7 +69,7 @@ def main() -> None:
     use_saved = "project-portfolio" in args
     buy_all = "buy-all" in args
     cancel_all = "cancel-all-orders" in args
-    print_comparison = "print-project-vs-actual" in args
+    print_comparison = "print-project-vs-current" in args
     all_exchanges = "-all-exchanges" in args
 
     # Mutual exclusivity checks.
@@ -77,12 +77,12 @@ def main() -> None:
                       print_comparison])
     if mode_flags > 1:
         print("Error: 'noop', 'noop-recalculate', 'project-portfolio', "
-              "'cancel-all-orders', and 'print-project-vs-actual' "
+              "'cancel-all-orders', and 'print-project-vs-current' "
               "are mutually exclusive.")
         sys.exit(1)
 
     if print_comparison:
-        print("Running in PRINT-PROJECT-VS-ACTUAL mode.\n")
+        print("Running in PRINT-PROJECT-VS-CURRENT mode.\n")
     elif cancel_all:
         print("Running in CANCEL-ALL-ORDERS mode.\n")
     elif noop:
@@ -108,21 +108,16 @@ def main() -> None:
 
     try:
         # ==============================================================
-        # print-project-vs-actual  (standalone mode)
-        # ==============================================================
-        if print_comparison:
-            generate_project_vs_actual(ib)
-
-        # ==============================================================
         # cancel-all-orders  (standalone mode)
         # ==============================================================
-        elif cancel_all:
+        if cancel_all:
             cancel_all_orders(ib, all_exchanges=all_exchanges)
 
         # ==============================================================
-        # project-portfolio  (load saved CSV, skip steps 2-4)
+        # project-portfolio / print-project-vs-current
+        # (load saved CSV, skip steps 2-4)
         # ==============================================================
-        elif use_saved:
+        elif use_saved or print_comparison:
             df = _load_project_portfolio()
 
         # ==============================================================
@@ -161,26 +156,31 @@ def main() -> None:
             save_project_portfolio(df)
 
         # ==============================================================
-        # Ordering section
+        # Ordering / comparison section
         # ==============================================================
-        if not noop and not noop_recalc and not cancel_all \
-                and not print_comparison:
+        if not noop and not noop_recalc and not cancel_all:
 
             # 5. Reconcile (unless buy-all).
             if not buy_all:
                 print("Reconciling target portfolio with IBKR state ...\n")
-                df = reconcile(ib, df, all_exchanges=all_exchanges)
+                df = reconcile(ib, df,
+                               all_exchanges=all_exchanges,
+                               dry_run=print_comparison)
 
-            # 5b. Filter to open exchanges.
-            if not all_exchanges:
-                print("Filtering to currently open exchanges ...\n")
-                df = filter_df_by_open_exchange(df)
+            if print_comparison:
+                # 6a. Write comparison Excel instead of placing orders.
+                generate_project_vs_current(ib, df)
+            else:
+                # 5b. Filter to open exchanges.
+                if not all_exchanges:
+                    print("Filtering to currently open exchanges ...\n")
+                    df = filter_df_by_open_exchange(df)
 
-            # 6. Interactive order loop.
-            placed = run_order_loop(ib, df)
+                # 6. Interactive order loop.
+                placed = run_order_loop(ib, df)
 
-            # 7. Summary.
-            print_order_summary(placed)
+                # 7. Summary.
+                print_order_summary(placed)
 
         elif noop or noop_recalc:
             print("\nNOOP mode -- skipping order placement. "
