@@ -16,6 +16,41 @@ from ib_async import IB
 from src.config import OUTPUT_DIR
 
 
+def _resolve_fx(row: pd.Series) -> float | None:
+    """Return the USD/local FX rate: 1.0 for USD, the rate for foreign, None if missing."""
+    ccy = row.get("currency")
+    fx_raw = row.get("fx_rate")
+    if pd.isna(ccy) or str(ccy).upper() == "USD":
+        return 1.0
+    if pd.notna(fx_raw) and float(fx_raw) > 0:
+        return float(fx_raw)
+    return None
+
+
+def _market_value_usd(
+    conid_raw, mkt_values: dict[int, float], fx: float | None,
+) -> float | None:
+    """Convert a position's local-currency market value to USD.
+
+    Returns ``0.0`` when the position has no market value (not held),
+    or ``None`` when the FX rate is missing.
+    """
+    if fx is None:
+        return None
+    conid = int(conid_raw) if pd.notna(conid_raw) else None
+    local = mkt_values.get(conid) if conid else None
+    if local is not None:
+        return round(local / fx, 2)
+    return 0.0
+
+
+def _safe_diff(a_raw, b: float | None) -> float | None:
+    """Return ``round(a - b, 2)`` if both values are present, else ``None``."""
+    if b is not None and pd.notna(a_raw):
+        return round(float(a_raw) - b, 2)
+    return None
+
+
 def generate_project_vs_current(ib: IB, df: pd.DataFrame) -> None:
     """Build and save the Project_VS_Current Excel comparison.
 
@@ -44,44 +79,14 @@ def generate_project_vs_current(ib: IB, df: pd.DataFrame) -> None:
     actual_vs_current: list[float | None] = []
 
     for _, row in df.iterrows():
-        conid_raw = row.get("conid")
-        fx_raw = row.get("fx_rate")
-        ccy = row.get("currency")
-        dollar_alloc = row.get("Dollar Allocation")
-        actual_alloc_raw = row.get("Actual Dollar Allocation")
+        fx = _resolve_fx(row)
+        mkt_usd = _market_value_usd(row.get("conid"), mkt_values, fx)
 
-        is_usd = pd.isna(ccy) or str(ccy).upper() == "USD"
-        if is_usd:
-            fx = 1.0
-        elif pd.notna(fx_raw) and float(fx_raw) > 0:
-            fx = float(fx_raw)
-        else:
-            fx = None
-
-        conid = int(conid_raw) if pd.notna(conid_raw) else None
-        mkt_value_local = mkt_values.get(conid) if conid else None
-
-        if mkt_value_local is not None:
-            if fx is not None and fx > 0:
-                mkt_value_usd = round(mkt_value_local / fx, 2)
-            else:
-                mkt_value_usd = None
-        else:
-            mkt_value_usd = 0.0 if (fx is not None) else None
-
-        current_dollar_amounts.append(mkt_value_usd)
-
-        if mkt_value_usd is not None and pd.notna(dollar_alloc):
-            project_vs_current.append(
-                round(float(dollar_alloc) - mkt_value_usd, 2))
-        else:
-            project_vs_current.append(None)
-
-        if mkt_value_usd is not None and pd.notna(actual_alloc_raw):
-            actual_vs_current.append(
-                round(float(actual_alloc_raw) - mkt_value_usd, 2))
-        else:
-            actual_vs_current.append(None)
+        current_dollar_amounts.append(mkt_usd)
+        project_vs_current.append(
+            _safe_diff(row.get("Dollar Allocation"), mkt_usd))
+        actual_vs_current.append(
+            _safe_diff(row.get("Actual Dollar Allocation"), mkt_usd))
 
     # --- 3. Assemble and save ---
     out = pd.DataFrame({

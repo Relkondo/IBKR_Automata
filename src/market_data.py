@@ -20,17 +20,12 @@ import urllib.request
 import pandas as pd
 from ib_async import IB, Contract, Forex
 
-from src.config import OUTPUT_DIR, PROJECT_PORTFOLIO_COLUMNS
+from src.config import FILL_PATIENCE, OUTPUT_DIR, PROJECT_PORTFOLIO_COLUMNS
 
 # ------------------------------------------------------------------
 # Snapshot batching
 # ------------------------------------------------------------------
 SNAPSHOT_BATCH_SIZE = 50
-
-# ------------------------------------------------------------------
-# Limit-price tuning
-# ------------------------------------------------------------------
-FILL_PATIENCE = 20  # 0 = cross spread immediately, 100 = sit on bid/ask
 
 
 # ------------------------------------------------------------------

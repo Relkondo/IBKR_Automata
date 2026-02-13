@@ -15,6 +15,7 @@ from __future__ import annotations
 import pandas as pd
 from ib_async import IB
 
+from src.config import STALE_ORDER_TOL_PCT, STALE_ORDER_TOL_PCT_ILLIQUID
 from src.connection import suppress_errors
 from src.exchange_hours import is_exchange_open
 from src.extra_positions import compute_net_quantity, reconcile_extra_positions
@@ -186,8 +187,6 @@ def _cancel_stale_orders(
     cancel_confirm_all, cancel_skip_all : bool
     cancel_confirm_exchanges, cancel_skip_exchanges : set[str]
     """
-    PRICE_TOL_PCT = 0.005
-    PRICE_TOL_PCT_ILLIQUID = 0.05
     _ILLIQUID_MICS = {"XFRA", "OTCM"}
 
     # Start with a copy — orders not touched by any row stay as-is.
@@ -224,9 +223,9 @@ def _cancel_stale_orders(
             can_cancel = is_exchange_open(str(mic).strip())
 
         mic_str = str(mic).strip().upper() if pd.notna(mic) else ""
-        tol_pct = (PRICE_TOL_PCT_ILLIQUID
+        tol_pct = (STALE_ORDER_TOL_PCT_ILLIQUID
                    if mic_str in _ILLIQUID_MICS
-                   else PRICE_TOL_PCT)
+                   else STALE_ORDER_TOL_PCT)
 
         kept: list[dict] = []
         cancelled = 0
