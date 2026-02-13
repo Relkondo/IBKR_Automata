@@ -9,14 +9,12 @@ cover) those positions.
 
 from __future__ import annotations
 
-import time
-
 import pandas as pd
+from ib_async import IB, Contract, Forex
 
-from src.api_client import IBKRClient
 from src.contracts import exchange_to_mic
 from src.exchange_hours import is_exchange_open
-from src.market_data import _poll_snapshot, BATCH_SIZE, SPEED_VS_GREED
+from src.market_data import _poll_snapshot, _safe_float, BATCH_SIZE, SPEED_VS_GREED
 
 
 # ------------------------------------------------------------------
@@ -24,8 +22,7 @@ from src.market_data import _poll_snapshot, BATCH_SIZE, SPEED_VS_GREED
 # ------------------------------------------------------------------
 
 def reconcile_extra_positions(
-    client: IBKRClient,
-    account_id: str,
+    ib: IB,
     extra_conids: list[int],
     positions: dict[int, float],
     position_meta: dict[int, dict],
@@ -38,27 +35,6 @@ def reconcile_extra_positions(
 ) -> tuple[list[dict], int, bool, bool, set[str], set[str]]:
     """Process IBKR positions not in the input file.
 
-    Parameters
-    ----------
-    client : IBKRClient
-        Authenticated API client.
-    account_id : str
-        IBKR account identifier.
-    extra_conids : list[int]
-        Conids that exist in IBKR positions but not in the input file.
-    positions : dict[int, float]
-        ``{conid: signed_position_qty}``.
-    position_meta : dict[int, dict]
-        ``{conid: {ticker, name, currency, exchange}}``.
-    orders_by_conid : dict[int, list[dict]]
-        Open orders grouped by conid.
-    all_exchanges : bool
-        When ``False``, skip cancellations for closed exchanges.
-    cancel_confirm_all, cancel_skip_all : bool
-        Current global consent flags (may be mutated).
-    cancel_confirm_exchanges, cancel_skip_exchanges : set[str]
-        Per-exchange consent sets (may be mutated).
-
     Returns
     -------
     extra_rows : list[dict]
@@ -66,38 +42,39 @@ def reconcile_extra_positions(
     extra_cancelled : int
         Number of stale orders cancelled for extra positions.
     cancel_confirm_all, cancel_skip_all : bool
-        Potentially updated global consent flags.
     cancel_confirm_exchanges, cancel_skip_exchanges : set[str]
-        Potentially updated per-exchange consent sets.
     """
     print(f"\nFound {len(extra_conids)} IBKR position(s) not in the "
           f"input file. Fetching market data to prepare sell orders ...")
 
     # --- Fetch currency info for extra conids --------------------------
-    extra_currencies: dict[int, str] = {}   # conid -> currency
-    extra_fx: dict[int, float] = {}          # conid -> fx_rate
-    try:
-        secdef_data = client.get_secdef_batch(extra_conids)
-        if isinstance(secdef_data, dict):
-            secdef_data = secdef_data.get("secdef", [])
-        for sd in secdef_data:
-            cid = sd.get("conid")
-            ccy = sd.get("currency", "USD")
-            if cid is not None:
-                extra_currencies[int(cid)] = ccy
-    except Exception as exc:
-        print(f"  [!] Could not fetch secdef for extra positions: {exc}")
+    extra_currencies: dict[int, str] = {}
+    extra_fx: dict[int, float] = {}
+    for cid in extra_conids:
+        c = Contract(conId=cid)
+        try:
+            details = ib.reqContractDetails(c)
+            if details:
+                ccy = details[0].contract.currency or "USD"
+                extra_currencies[cid] = ccy.upper()
+        except Exception as exc:
+            print(f"  [!] Could not fetch details for conid {cid}: {exc}")
+        ib.sleep(0.02)
 
     # Fetch exchange rates for unique non-USD currencies.
     unique_ccys = set(c for c in extra_currencies.values() if c != "USD")
     fx_rates: dict[str, float] = {}
     for ccy in unique_ccys:
         try:
-            rate_resp = client.get_exchange_rate("USD", ccy)
-            rate = (rate_resp.get("rate", 0)
-                    if isinstance(rate_resp, dict) else 0)
+            pair = f"{ccy}USD"
+            fx_contract = Forex(pair)
+            ib.qualifyContracts(fx_contract)
+            t = ib.reqMktData(fx_contract, snapshot=True)
+            ib.sleep(2)
+            rate = _safe_float(t.marketPrice())
+            ib.cancelMktData(fx_contract)
             if rate and rate > 0:
-                fx_rates[ccy] = rate
+                fx_rates[ccy] = round(1.0 / rate, 6)
             else:
                 print(f"  [!] Could not get FX rate for USD->{ccy}")
         except Exception as exc:
@@ -109,13 +86,26 @@ def reconcile_extra_positions(
             extra_fx[cid] = 1.0
         elif ccy in fx_rates:
             extra_fx[cid] = fx_rates[ccy]
-        # else: no rate -> the order loop will skip this row
 
-    # --- Fetch market data ---------------------------------------------
+    # --- Fetch market data for extra conids ----------------------------
+    # Build Contract objects.
+    extra_contracts: list[Contract] = []
+    for cid in extra_conids:
+        c = Contract(conId=cid)
+        try:
+            details = ib.reqContractDetails(c)
+            if details:
+                extra_contracts.append(details[0].contract)
+            else:
+                extra_contracts.append(c)
+        except Exception:
+            extra_contracts.append(c)
+        ib.sleep(0.02)
+
     snapshot: dict[int, dict] = {}
-    for i in range(0, len(extra_conids), BATCH_SIZE):
-        batch = extra_conids[i : i + BATCH_SIZE]
-        batch_result = _poll_snapshot(client, batch)
+    for i in range(0, len(extra_contracts), BATCH_SIZE):
+        batch = extra_contracts[i : i + BATCH_SIZE]
+        batch_result = _poll_snapshot(ib, batch)
         snapshot.update(batch_result)
 
     # --- Cancel stale open orders on extra conids ----------------------
@@ -138,7 +128,6 @@ def reconcile_extra_positions(
                       f"(exchange {mic_code} closed)")
                 continue
 
-            # Consent checks.
             if cancel_skip_all or mic_code in cancel_skip_exchanges:
                 print(f"  Extra-position stale order "
                       f"{order['orderId']} for '{pos_name}' skipped "
@@ -177,12 +166,14 @@ def reconcile_extra_positions(
                     continue
 
             try:
-                client.cancel_order(account_id, order["orderId"])
+                trade_obj = order.get("trade")
+                if trade_obj:
+                    ib.cancelOrder(trade_obj.order)
+                ib.sleep(0.3)
                 auto_tag = " (auto)" if auto else ""
                 print(f"  Cancelled extra-position order "
                       f"{order['orderId']} for '{pos_name}'{auto_tag}")
                 extra_cancelled += 1
-                time.sleep(0.2)
             except Exception as exc:
                 print(f"  [!] Failed to cancel order "
                       f"{order['orderId']}: {exc}")
@@ -230,10 +221,9 @@ def reconcile_extra_positions(
         }
 
         # Compute limit price.
-        # Long positions (existing > 0) -> SELL formula.
-        # Short positions (existing < 0) -> BUY formula (cover).
         limit_price = None
         if existing > 0:
+            # SELL formula.
             if mark_val is not None and ask_val is not None:
                 limit_price = round(
                     ask_val - (mark_val - ask_val) / SPEED_VS_GREED, 2)
@@ -245,6 +235,7 @@ def reconcile_extra_positions(
             elif ask_val is not None:
                 limit_price = round(ask_val, 2)
         else:
+            # BUY (cover) formula.
             if mark_val is not None and bid is not None:
                 limit_price = round(
                     bid - (mark_val - bid) / SPEED_VS_GREED, 2)
@@ -257,10 +248,6 @@ def reconcile_extra_positions(
                 limit_price = round(bid, 2)
 
         row_dict["limit_price"] = limit_price
-
-        # net_quantity: how many shares to order to reach target of 0.
-        # Long  (existing > 0): net = -existing  -> sell
-        # Short (existing < 0): net = +|existing| -> buy to cover
         row_dict["net_quantity"] = 0 - int(existing)
 
         extra_rows.append(row_dict)

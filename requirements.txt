@@ -1,5 +1,4 @@
-requests
+ib_async
 openpyxl
 pandas
-urllib3
 openai

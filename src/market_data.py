@@ -1,12 +1,9 @@
-"""Fetch market-data snapshots and compute limit prices.
+"""Fetch market-data snapshots and compute limit prices via ib_async.
 
-The IBKR snapshot endpoint is subscription-based: the first call only
-*initiates* subscriptions.  We therefore issue an explicit priming call,
-then poll with an adaptive strategy that stops early once enough data
-has been collected.
+Uses ``ib.reqMktData(snapshot=True)`` for price data and ``Forex()``
+contracts for exchange rates.
 
-Fields queried: bid (84), ask (86), mark price (7635),
-day high (70), day low (71).
+Fields used: bid, ask, marketPrice (mark), high (day high), low (day low).
 
 Limit-price formula uses a SPEED_VS_GREED parameter that controls how
 aggressively we undercut/overcut the reference price.
@@ -14,30 +11,18 @@ aggressively we undercut/overcut the reference price.
 
 import math
 import os
-import time
 
 import pandas as pd
+from ib_async import IB, Contract, Forex, Ticker as IbTicker
 
-from src.api_client import IBKRClient
-from src.config import OPENAI_API_KEY_FILE, OUTPUT_DIR
-
-# ------------------------------------------------------------------
-# IBKR field codes
-# ------------------------------------------------------------------
-FIELD_BID = "84"
-FIELD_ASK = "86"
-FIELD_MARK = "7635"
-FIELD_DAY_HIGH = "70"
-FIELD_DAY_LOW = "71"
-
-ALL_FIELDS = [FIELD_BID, FIELD_ASK, FIELD_MARK, FIELD_DAY_HIGH, FIELD_DAY_LOW]
+from src.config import OUTPUT_DIR
 
 # ------------------------------------------------------------------
 # Polling parameters
 # ------------------------------------------------------------------
-PRIME_DELAY_SECONDS = 3
-POLL_DELAY_SECONDS = 2
 BATCH_SIZE = 50
+POLL_DELAY_SECONDS = 2
+MAX_POLLS = 5
 
 # ------------------------------------------------------------------
 # Limit-price tuning
@@ -49,71 +34,61 @@ SPEED_VS_GREED = 20
 # Helpers
 # ------------------------------------------------------------------
 
-def _try_float(value) -> float | None:
-    """Convert *value* to float, returning None on failure."""
+def _safe_float(val) -> float | None:
+    """Return *val* as float if it's a real number, else None."""
+    if val is None:
+        return None
     try:
-        return float(value)
+        f = float(val)
+        if math.isnan(f) or math.isinf(f):
+            return None
+        return f
     except (TypeError, ValueError):
         return None
 
 
-def _poll_snapshot(client: IBKRClient, conids: list[int]) -> dict[int, dict]:
-    """Poll the snapshot endpoint with adaptive early-exit logic.
+def _poll_snapshot(ib: IB, contracts: list[Contract],
+                   ) -> dict[int, dict]:
+    """Request snapshot market data for a batch of contracts.
 
-    Polling strategy (after the priming call):
-      Poll 1-2 : always execute.
-      After 2  : stop if every conid has bid/ask OR day-high/low.
-      Poll 3   : executed only if the above condition is not met.
-      After 3  : stop if every conid has at least mark price.
-      Poll 4-5 : executed only if some conids still lack mark price.
+    TWS returns live data when a subscription exists, or delayed data
+    otherwise (market data type 3 is set at connection time).  We poll
+    with adaptive early-exit logic (up to MAX_POLLS rounds).
 
-    Returns a dict mapping ``conid -> {"bid", "ask", "mark", "high", "low"}``
-    where each value is ``float | None``.
+    Returns a dict ``{conid: {bid, ask, mark, high, low}}``.
     """
-    # Accumulator – we merge values across polls so later polls can
-    # fill in fields that were missing earlier.
+    if not contracts:
+        return {}
+
     result: dict[int, dict] = {}
+    tickers: list[IbTicker] = []
 
-    # --- Priming call: initiate subscriptions (data not expected) ---
-    try:
-        client.get_market_snapshot(conids, fields=ALL_FIELDS)
-    except Exception as exc:
-        print(f"  [!] Priming snapshot request failed: {exc}")
-
-    time.sleep(PRIME_DELAY_SECONDS)
-
-    if not conids:
-        return result
-
-    max_polls = 5
-
-    for attempt in range(1, max_polls + 1):
+    # Request snapshots for all contracts.
+    for c in contracts:
         try:
-            data = client.get_market_snapshot(conids, fields=ALL_FIELDS)
+            t = ib.reqMktData(c, genericTickList="",
+                              snapshot=True, regulatorySnapshot=False)
+            tickers.append(t)
         except Exception as exc:
-            print(f"  [!] Snapshot request failed (poll {attempt}): {exc}")
-            time.sleep(POLL_DELAY_SECONDS)
-            continue
+            print(f"  [!] reqMktData failed for conid {c.conId}: {exc}")
 
-        for entry in data:
-            cid = int(entry.get("conid", 0))
-            if cid == 0:
-                continue
+    # Allow initial data to arrive.
+    ib.sleep(POLL_DELAY_SECONDS)
 
-            bid = _try_float(entry.get(FIELD_BID))
-            ask = _try_float(entry.get(FIELD_ASK))
-            mark = _try_float(entry.get(FIELD_MARK))
-            high = _try_float(entry.get(FIELD_DAY_HIGH))
-            low = _try_float(entry.get(FIELD_DAY_LOW))
+    conid_map = {t.contract.conId: t for t in tickers if t.contract}
 
-            # Log raw values on the first real poll for diagnostics.
+    for attempt in range(1, MAX_POLLS + 1):
+        for cid, t in conid_map.items():
+            bid = _safe_float(t.bid)
+            ask = _safe_float(t.ask)
+            mark = _safe_float(t.marketPrice())
+            high = _safe_float(t.high)
+            low = _safe_float(t.low)
+
             if attempt == 1:
-                print(
-                    f"    conid={cid}: bid={bid!r}, ask={ask!r}, "
-                    f"mark={mark!r}, high={high!r}, low={low!r}"
-                )
+                print(f"    conid={cid}: bid={bid!r}, ask={ask!r}, "
+                      f"mark={mark!r}, high={high!r}, low={low!r}")
 
-            # Merge into accumulator, keeping the best known value.
             if cid not in result:
                 result[cid] = {
                     "bid": None, "ask": None,
@@ -131,48 +106,39 @@ def _poll_snapshot(client: IBKRClient, conids: list[int]) -> dict[int, dict]:
             if low is not None:
                 rec["low"] = low
 
-        # --- Reporting ---
         n_with_data = sum(
             1 for r in result.values()
             if any(v is not None for v in r.values())
         )
-        print(
-            f"  Poll {attempt}/{max_polls}: "
-            f"{n_with_data}/{len(conids)} conids with some data"
-        )
+        print(f"  Poll {attempt}/{MAX_POLLS}: "
+              f"{n_with_data}/{len(contracts)} conids with some data")
 
-        # --- Adaptive early-exit checks ---
+        # Adaptive early-exit.
         if attempt >= 2:
-            # After poll 2+: stop if every conid has bid/ask OR high/low.
-            all_have_price_range = all(
+            all_have_range = all(
                 (r["bid"] is not None and r["ask"] is not None)
                 or (r["high"] is not None and r["low"] is not None)
                 for r in result.values()
             ) if result else False
-
-            if all_have_price_range and len(result) == len(conids):
+            if all_have_range and len(result) == len(contracts):
                 print("  -> All conids have bid/ask or high/low. Stopping.")
                 break
 
         if attempt >= 3:
-            # After poll 3+: stop if every conid has at least mark price.
             all_have_mark = all(
                 r["mark"] is not None for r in result.values()
             ) if result else False
-
-            if all_have_mark and len(result) == len(conids):
+            if all_have_mark and len(result) == len(contracts):
                 print("  -> All conids have mark price. Stopping.")
                 break
 
-        if attempt < max_polls:
-            time.sleep(POLL_DELAY_SECONDS)
+        if attempt < MAX_POLLS:
+            ib.sleep(POLL_DELAY_SECONDS)
 
-    no_data = len(conids) - len(result)
+    no_data = len(contracts) - len(result)
     if no_data > 0:
-        print(
-            f"  [!] {no_data} conids got no data after "
-            f"{max_polls} polls. Data may be unavailable."
-        )
+        print(f"  [!] {no_data} conids got no data after "
+              f"{MAX_POLLS} polls.")
 
     return result
 
@@ -200,7 +166,6 @@ def _calc_limit_price(row) -> float | None:
     high = row.get("day_high")
     low = row.get("day_low")
 
-    # We need at least mark price to compute anything useful.
     if pd.isna(mark) and pd.isna(bid) and pd.isna(ask):
         return None
 
@@ -233,95 +198,62 @@ def _calc_limit_price(row) -> float | None:
 # Currency resolution
 # ------------------------------------------------------------------
 
-# Batch size for /trsrv/secdef (URL length can be an issue with many conids).
-_SECDEF_BATCH = 50
 
+def _try_forex_snapshot(ib: IB, pair: str) -> float | None:
+    """Request a snapshot for Forex *pair* and return the rate, or None.
 
-def _ask_llm_for_fx_rate(currency: str) -> float | None:
-    """Ask an LLM for the approximate USD -> *currency* exchange rate."""
-    try:
-        with open(OPENAI_API_KEY_FILE) as f:
-            api_key = f.read().strip()
-    except FileNotFoundError:
-        return None
-    if not api_key:
-        return None
-
-    try:
-        from openai import OpenAI
-    except ImportError:
-        print("  [!] openai package not installed – skipping LLM fallback.")
-        return None
-
-    prompt = (
-        f"What is the current approximate exchange rate from 1 USD to {currency}? "
-        f"Reply with ONLY the numeric rate (e.g. 31.5), nothing else."
-    )
-
-    try:
-        llm = OpenAI(api_key=api_key)
-        response = llm.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0,
-            max_tokens=20,
-        )
-        text = response.choices[0].message.content.strip()
-        rate = float(text)
-        if rate > 0:
-            return rate
-    except Exception as exc:
-        print(f"  [!] LLM request failed: {exc}")
-
-    return None
-
-
-def _resolve_fx_rate(client: IBKRClient, ccy: str) -> float | None:
-    """Try every available method to obtain the USD -> *ccy* rate.
-
-    Fallback chain:
-      1. IBKR ``/iserver/exchangerate`` (forward).
-      2. IBKR ``/iserver/exchangerate`` (reverse, then invert).
-      3. Ask the OpenAI LLM for an approximate rate; confirm with user.
-      4. Ask the user to type the rate manually.
-
-    Returns the rate (local per 1 USD) or None if the user declines.
+    Qualifies the contract first; skips silently if qualification fails.
+    Does NOT call cancelMktData — snapshots auto-cancel on receipt.
     """
-    # --- Attempt 1: IBKR forward ---
-    try:
-        rate = client.get_exchange_rate(source="USD", target=ccy)
-        if rate is not None and float(rate) > 0:
-            print(f"  USD -> {ccy} = {rate}")
-            return float(rate)
-    except Exception as exc:
-        print(f"  [!] Exchange rate request failed for {ccy}: {exc}")
+    fx = Forex(pair)
+    ib.qualifyContracts(fx)
+    if not fx.conId:
+        return None  # pair doesn't exist on IDEALPRO
+    t = ib.reqMktData(fx, snapshot=True)
+    ib.sleep(2)
+    rate = _safe_float(t.marketPrice())
+    return rate if rate and rate > 0 else None
 
-    # --- Attempt 2: IBKR reverse ---
-    try:
-        print(f"  [!] USD -> {ccy} unavailable, trying reverse ...")
-        rev = client.get_exchange_rate(source=ccy, target="USD")
-        if rev is not None and float(rev) > 0:
-            inverted = round(1.0 / float(rev), 6)
-            print(f"  {ccy} -> USD = {rev}  =>  USD -> {ccy} = {inverted}")
+
+# Currencies where the convention is {ccy}USD (ccy is base, not USD).
+_CCY_AS_BASE = {"EUR", "GBP", "AUD", "NZD"}
+
+
+def _resolve_fx_rate(ib: IB, ccy: str) -> float | None:
+    """Obtain the USD -> *ccy* exchange rate.
+
+    Tries the standard Forex pair convention first, then the reverse.
+    Falls back to manual input.
+
+    Returns the rate (units of *ccy* per 1 USD) or None.
+    """
+    if ccy in _CCY_AS_BASE:
+        # Convention: {ccy}USD → price is "USD per 1 ccy", invert.
+        rate = _try_forex_snapshot(ib, f"{ccy}USD")
+        if rate is not None:
+            inverted = round(1.0 / rate, 6)
+            print(f"  USD -> {ccy} = {inverted}")
             return inverted
-    except Exception as exc:
-        print(f"  [!] Reverse exchange rate request failed for {ccy}: {exc}")
-
-    # --- Attempt 3: LLM fallback ---
-    print(f"  [~] Asking LLM for USD -> {ccy} rate ...")
-    llm_rate = _ask_llm_for_fx_rate(ccy)
-    if llm_rate is not None:
-        user_input = input(
-            f"  LLM suggests USD -> {ccy} = {llm_rate}. "
-            f"Accept? [Y] Yes  [N] Enter manually  > "
-        ).strip().upper()
-        if user_input == "Y" or user_input == "":
-            print(f"  USD -> {ccy} = {llm_rate} (LLM, confirmed)")
-            return llm_rate
+        # Fallback: try reverse.
+        rate = _try_forex_snapshot(ib, f"USD{ccy}")
+        if rate is not None:
+            print(f"  USD -> {ccy} = {rate}")
+            return rate
     else:
-        print(f"  [!] LLM could not provide a rate for {ccy}.")
+        # Convention: USD{ccy} → price is "ccy per 1 USD", direct.
+        rate = _try_forex_snapshot(ib, f"USD{ccy}")
+        if rate is not None:
+            print(f"  USD -> {ccy} = {rate}")
+            return rate
+        # Fallback: try reverse.
+        rate = _try_forex_snapshot(ib, f"{ccy}USD")
+        if rate is not None:
+            inverted = round(1.0 / rate, 6)
+            print(f"  USD -> {ccy} = {inverted}")
+            return inverted
 
-    # --- Attempt 4: manual input ---
+    # --- Attempt 3: manual input ---
+    print(f"  [!] Could not fetch Forex rate for {ccy}.")
     user_input = input(
         f"  Enter USD -> {ccy} rate (or press Enter to skip {ccy}): "
     ).strip()
@@ -341,18 +273,11 @@ def _resolve_fx_rate(client: IBKRClient, ccy: str) -> float | None:
     return None
 
 
-def resolve_currencies(client: IBKRClient, df: pd.DataFrame) -> pd.DataFrame:
+def resolve_currencies(ib: IB, df: pd.DataFrame) -> pd.DataFrame:
     """Add ``currency`` and ``fx_rate`` columns to the portfolio table.
 
-    1. Fetch the trading currency for every resolved conid via
-       ``/trsrv/secdef``.
-    2. For each non-USD currency, fetch the USD -> local exchange rate
-       via ``/iserver/exchangerate``.
-    3. Store the results so that downstream quantity calculations can
-       convert the USD *Dollar Allocation* to local-currency terms.
-
-    ``fx_rate`` is the number of local-currency units per 1 USD.
-    For USD positions, ``fx_rate`` = 1.0.
+    Uses ``ib.reqContractDetails()`` to fetch the trading currency for
+    each contract, and ``Forex()`` snapshots for exchange rates.
     """
     valid = df[df["conid"].notna()].copy()
     all_conids = valid["conid"].astype(int).tolist()
@@ -364,29 +289,29 @@ def resolve_currencies(client: IBKRClient, df: pd.DataFrame) -> pd.DataFrame:
 
     print(f"Resolving currencies for {len(all_conids)} contracts ...")
 
-    # --- Step 1: fetch currency per conid ---
+    # Build Contract objects from conids and ask for details.
     cid_to_currency: dict[int, str] = {}
-    for i in range(0, len(all_conids), _SECDEF_BATCH):
-        batch = all_conids[i : i + _SECDEF_BATCH]
+    for cid in all_conids:
+        c = Contract(conId=cid)
         try:
-            data = client.get_secdef_batch(batch)
-            for entry in data:
-                cid = entry.get("conid")
-                ccy = entry.get("currency")
-                if cid is not None and ccy:
-                    cid_to_currency[int(cid)] = ccy.upper()
+            details = ib.reqContractDetails(c)
+            if details:
+                ccy = details[0].contract.currency
+                if ccy:
+                    cid_to_currency[cid] = ccy.upper()
         except Exception as exc:
-            print(f"  [!] /trsrv/secdef batch failed: {exc}")
+            print(f"  [!] Currency fetch failed for conid {cid}: {exc}")
+        ib.sleep(0.05)
 
-    # --- Step 2: fetch exchange rates for unique non-USD currencies ---
+    # Fetch exchange rates for unique non-USD currencies.
     unique_currencies = set(cid_to_currency.values()) - {"USD"}
     fx_rates: dict[str, float] = {"USD": 1.0}
     for ccy in sorted(unique_currencies):
-        resolved = _resolve_fx_rate(client, ccy)
+        resolved = _resolve_fx_rate(ib, ccy)
         if resolved is not None:
             fx_rates[ccy] = resolved
 
-    # --- Step 3: map back to the DataFrame ---
+    # Map back to the DataFrame.
     currencies: list[str | None] = []
     rates: list[float | None] = []
     for _, row in df.iterrows():
@@ -411,13 +336,10 @@ def resolve_currencies(client: IBKRClient, df: pd.DataFrame) -> pd.DataFrame:
 # Public API
 # ------------------------------------------------------------------
 
-def fetch_market_data(client: IBKRClient, df: pd.DataFrame) -> pd.DataFrame:
+def fetch_market_data(ib: IB, df: pd.DataFrame) -> pd.DataFrame:
     """Populate market-data columns and compute limit prices.
 
     Only rows with a valid (non-null) conid are queried.
-
-    New columns added: ``bid``, ``ask``, ``mark``, ``day_high``,
-    ``day_low``, ``limit_price``.
     """
     valid = df[df["conid"].notna()].copy()
     all_conids = valid["conid"].astype(int).tolist()
@@ -430,14 +352,30 @@ def fetch_market_data(client: IBKRClient, df: pd.DataFrame) -> pd.DataFrame:
 
     print(f"Fetching market data for {len(all_conids)} contracts ...")
 
+    # Build a Contract for each conid.
+    conid_to_contract: dict[int, Contract] = {}
+    for cid in all_conids:
+        c = Contract(conId=cid)
+        try:
+            details = ib.reqContractDetails(c)
+            if details:
+                conid_to_contract[cid] = details[0].contract
+            else:
+                conid_to_contract[cid] = c
+        except Exception:
+            conid_to_contract[cid] = c
+        ib.sleep(0.02)
+
     snapshot: dict[int, dict] = {}
 
     # Process in batches.
-    for i in range(0, len(all_conids), BATCH_SIZE):
-        batch = all_conids[i : i + BATCH_SIZE]
+    contracts_list = [conid_to_contract[cid] for cid in all_conids
+                      if cid in conid_to_contract]
+    for i in range(0, len(contracts_list), BATCH_SIZE):
+        batch = contracts_list[i : i + BATCH_SIZE]
         print(f"\n  Batch {i // BATCH_SIZE + 1} "
               f"({len(batch)} conids) ...")
-        batch_result = _poll_snapshot(client, batch)
+        batch_result = _poll_snapshot(ib, batch)
         snapshot.update(batch_result)
 
     # Map back to the DataFrame.
@@ -466,24 +404,14 @@ def fetch_market_data(client: IBKRClient, df: pd.DataFrame) -> pd.DataFrame:
 
     df["limit_price"] = df.apply(_calc_limit_price, axis=1)
 
-    # Qty = floor(|Dollar Allocation converted to local currency| / limit_price), signed.
-    # Dollar Allocation is in USD; limit_price is in the local trading
-    # currency.  We use fx_rate (local per 1 USD) to convert before dividing.
-    # Actual Dollar Allocation (USD) = limit_price * |Qty| / fx_rate.
     def _get_fx(r) -> float | None:
-        """Return the fx_rate for the row.
-
-        Returns 1.0 for USD positions, the stored rate for others,
-        or None if the rate is missing/zero for a non-USD currency.
-        """
         ccy = r.get("currency")
         fx = r.get("fx_rate")
-        # USD positions don't need conversion.
         if pd.isna(ccy) or str(ccy).upper() == "USD":
             return 1.0
         if pd.notna(fx) and float(fx) > 0:
             return float(fx)
-        return None  # non-USD with no usable rate
+        return None
 
     def _planned_qty(r):
         lp = r.get("limit_price")
@@ -498,8 +426,6 @@ def fetch_market_data(client: IBKRClient, df: pd.DataFrame) -> pd.DataFrame:
         return shares if float(da) >= 0 else -shares
 
     df["Qty"] = df.apply(_planned_qty, axis=1)
-    # Preserve the sign of Qty so that Actual Dollar Allocation is
-    # negative for short-sell positions (matching Dollar Allocation sign).
     df["Actual Dollar Allocation"] = df.apply(
         lambda r: round(
             float(r["limit_price"]) * float(r["Qty"]) / (_get_fx(r) or 1.0),
@@ -522,13 +448,9 @@ def fetch_market_data(client: IBKRClient, df: pd.DataFrame) -> pd.DataFrame:
 
 
 def save_project_portfolio(df: pd.DataFrame) -> str:
-    """Export the portfolio table to ``output/Project_Portfolio.csv``.
-
-    Returns the path to the written file.
-    """
+    """Export the portfolio table to ``output/Project_Portfolio.csv``."""
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     out_path = os.path.join(OUTPUT_DIR, "Project_Portfolio.csv")
-    # Drop internal helper columns that aren't useful in the output.
     drop_cols = [c for c in ("effective_ticker",) if c in df.columns]
     df.drop(columns=drop_cols).to_csv(out_path, index=False)
     print(f"Portfolio saved to {out_path}")

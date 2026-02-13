@@ -76,11 +76,11 @@ def _effective_ticker(row: pd.Series) -> str:
 
 
 def _clean_ticker(ticker: str) -> str:
-    """Strip the exchange suffix (e.g. 'NVDA US' -> 'NVDA')."""
-    parts = ticker.rsplit(" ", 1)
-    if len(parts) == 2 and parts[1].isalpha() and len(parts[1]) <= 4:
-        return parts[0]
-    return ticker
+    """Strip Bloomberg-style suffixes (e.g. 'NVDA US Equity' -> 'NVDA')."""
+    return re.sub(
+        r"\s+[A-Z]{2}\s+(?:Equity|Index)$", "", ticker.strip(),
+        flags=re.IGNORECASE,
+    ).strip()
 
 
 def load_portfolio(xlsx_path: str | None = None) -> pd.DataFrame:

@@ -1,13 +1,13 @@
-"""Reconcile the target portfolio against IBKR's current state.
+"""Reconcile the target portfolio against IBKR's current state via ib_async.
 
 Compares the Project_Portfolio (desired state) to existing positions and
 pending orders on IBKR, computing the *net* quantity that still needs to
 be ordered for each conid.  Stale pending orders whose limit price no
 longer matches are cancelled and their quantity is reclaimed.
 
-The result is a DataFrame identical to the input but with an extra
-``net_quantity`` column that the order loop should use instead of
-computing quantity from raw dollar allocation.
+The result is a DataFrame identical to the input but with extra columns:
+``existing_qty``, ``pending_qty``, ``target_qty``, ``net_quantity``,
+and ``cancelled_orders``.
 """
 
 from __future__ import annotations
@@ -16,86 +16,82 @@ import math
 import time
 
 import pandas as pd
+from ib_async import IB, Trade
 
-from src.api_client import IBKRClient
 from src.exchange_hours import is_exchange_open
 from src.extra_positions import reconcile_extra_positions
 from src.orders import get_account_id
+from src.contracts import exchange_to_mic
 
 
 # ------------------------------------------------------------------
 # Data fetchers
 # ------------------------------------------------------------------
 
-def _fetch_positions(client: IBKRClient,
-                     account_id: str,
+def _fetch_positions(ib: IB,
                      ) -> tuple[dict[int, float], dict[int, dict]]:
     """Return positions and their raw metadata.
 
     Returns
     -------
     positions : dict[int, float]
-        Mapping ``{conid: signed_position_qty}``.
+        ``{conid: signed_position_qty}``.
     meta : dict[int, dict]
-        Mapping ``{conid: {ticker, name, currency, exchange}}``.
-
-    IBKR may return duplicate entries for the same conid across pages;
-    we keep the last entry per conid to avoid double-counting.
+        ``{conid: {ticker, name, currency, exchange}}``.
     """
-    raw = client.get_positions(account_id)
+    raw = ib.positions()
     positions: dict[int, float] = {}
     meta: dict[int, dict] = {}
-    for entry in raw:
-        cid = entry.get("conid")
-        qty = entry.get("position", 0)
-        if cid is not None:
-            cid_int = int(cid)
-            positions[cid_int] = float(qty)
-            desc = entry.get("contractDesc", "")
-            meta[cid_int] = {
-                "ticker": entry.get("ticker") or str(desc),
-                "name": entry.get("name") or str(desc),
-                "currency": entry.get("currency") or "USD",
-                "exchange": entry.get("listingExchange") or "",
+    for pos in raw:
+        c = pos.contract
+        cid = c.conId
+        if cid:
+            positions[cid] = float(pos.position)
+            meta[cid] = {
+                "ticker": c.symbol or str(cid),
+                "name": c.symbol or str(cid),
+                "currency": c.currency or "USD",
+                "exchange": c.primaryExchange or c.exchange or "",
             }
     return positions, meta
 
 
-def _fetch_open_orders(client: IBKRClient) -> list[dict]:
-    """Return the list of open orders with normalised fields.
+def _fetch_open_orders(ib: IB) -> list[dict]:
+    """Return open orders as normalised dicts.
 
     Each dict has: ``conid``, ``orderId``, ``side``, ``price``,
-    ``remainingQuantity``, ``status``.
+    ``remainingQuantity``, ``status``, ``trade`` (the Trade object).
     """
-    raw = client.get_live_orders()
+    trades = ib.openTrades()
     orders: list[dict] = []
-    for entry in raw:
-        cid = entry.get("conid") or entry.get("conidex")
-        oid = entry.get("orderId") or entry.get("order_id")
-        status = str(entry.get("status", "")).lower()
+    for trade in trades:
+        c = trade.contract
+        o = trade.order
+        status = trade.orderStatus.status
 
-        # Only consider orders that are still active.
-        if status in ("cancelled", "filled", "inactive"):
+        if status in ("Cancelled", "Filled", "Inactive"):
             continue
 
-        side = str(entry.get("side", "")).upper()
-        # Normalise IBKR's various side representations.
-        if side in ("B", "BOT", "BUY"):
+        side = o.action.upper() if o.action else ""
+        if side in ("B", "BOT"):
             side = "BUY"
-        elif side in ("S", "SLD", "SELL"):
+        elif side in ("S", "SLD"):
             side = "SELL"
 
-        price = entry.get("price")
-        remaining = entry.get("remainingQuantity") or entry.get("remaining_quantity") or entry.get("totalSize") or 0
-
-        if cid is not None and oid is not None:
+        cid = c.conId
+        if cid:
             orders.append({
-                "conid": int(str(cid).split(".")[0]),  # conidex can be "123.0"
-                "orderId": str(oid),
+                "conid": cid,
+                "orderId": o.orderId,
                 "side": side,
-                "price": float(price) if price is not None else None,
-                "remainingQuantity": float(remaining),
+                "price": o.lmtPrice if hasattr(o, "lmtPrice") else None,
+                "remainingQuantity": float(
+                    trade.orderStatus.remaining
+                    if trade.orderStatus.remaining
+                    else o.totalQuantity
+                ),
                 "status": status,
+                "trade": trade,
             })
     return orders
 
@@ -105,74 +101,41 @@ def _fetch_open_orders(client: IBKRClient) -> list[dict]:
 # ------------------------------------------------------------------
 
 def _signed_order_qty(order: dict) -> float:
-    """Return the pending order quantity as a signed number.
-
-    BUY orders are positive, SELL orders are negative.
-    """
+    """BUY orders positive, SELL orders negative."""
     qty = order["remainingQuantity"]
     return qty if order["side"] == "BUY" else -qty
 
 
-def reconcile(client: IBKRClient,
+def reconcile(ib: IB,
               df: pd.DataFrame,
               all_exchanges: bool = True) -> pd.DataFrame:
     """Compute net quantities and cancel stale orders.
 
-    For each row in *df* that has a valid ``conid`` and ``limit_price``:
-
-    1. Look up ``existing_qty`` from the user's IBKR positions.
-    2. Look up ``pending_qty`` from open orders for the same conid.
-    3. If a pending order exists at a **different** limit price, cancel it
-       and do not count its quantity towards ``pending_qty``.
-    4. ``target_qty = floor(|dollar_alloc| / limit_price)`` with the
-       correct sign.
-    5. ``net_qty = target_qty - existing_qty - pending_qty``.
-
-    When *all_exchanges* is ``False``, stale-order cancellation is
-    skipped for rows whose exchange is currently closed.  The stale
-    orders are counted as pending instead (so they are not lost).
-
-    The result DataFrame has new columns:
-    ``existing_qty``, ``pending_qty``, ``target_qty``, ``net_quantity``,
-    and ``cancelled_orders`` (number of stale orders cancelled for that row).
-
-    Parameters
-    ----------
-    client : IBKRClient
-        Authenticated API client.
-    df : pd.DataFrame
-        The Project_Portfolio DataFrame (must have ``conid``,
-        ``limit_price``, ``Dollar Allocation`` columns).
-    all_exchanges : bool
-        When ``False``, stale-order cancellation is skipped for rows
-        on exchanges that are currently closed.
-
-    Returns
-    -------
-    pd.DataFrame
-        A copy of *df* with the additional columns described above.
+    For each row with a valid ``conid`` and ``limit_price``:
+      1. existing_qty from IBKR positions.
+      2. pending_qty from open orders for the same conid.
+      3. Stale orders (different price) are cancelled.
+      4. target_qty = floor(|dollar_alloc * fx| / limit_price) with sign.
+      5. net_qty = target - existing - pending.
     """
-    account_id = get_account_id(client)
+    account_id = get_account_id(ib)
 
     print("Fetching current IBKR positions ...")
-    positions, position_meta = _fetch_positions(client, account_id)
+    positions, position_meta = _fetch_positions(ib)
     print(f"  Found {len(positions)} positions.\n")
 
     print("Fetching open orders ...")
-    open_orders = _fetch_open_orders(client)
+    open_orders = _fetch_open_orders(ib)
     print(f"  Found {len(open_orders)} active open orders.\n")
 
-    # Group open orders by conid for efficient lookup.
     orders_by_conid: dict[int, list[dict]] = {}
     for o in open_orders:
         orders_by_conid.setdefault(o["conid"], []).append(o)
 
-    # Price tolerance for comparing limit prices (percentage of order price).
-    # Illiquid exchanges (FWB2, PINK) have wider spreads, so we use a
-    # more generous tolerance to avoid unnecessary cancellations.
-    PRICE_TOL_PCT = 0.005          # 0.5 % for liquid exchanges (default)
-    PRICE_TOL_PCT_ILLIQUID = 0.05  # 5 % for illiquid exchanges
-    _ILLIQUID_MICS = {"XFRA", "OTCM"}  # FWB2 -> XFRA, PINK -> OTCM
+    # Price tolerances.
+    PRICE_TOL_PCT = 0.005
+    PRICE_TOL_PCT_ILLIQUID = 0.05
+    _ILLIQUID_MICS = {"XFRA", "OTCM"}
 
     existing_qtys: list[float | None] = []
     pending_qtys: list[float | None] = []
@@ -180,7 +143,7 @@ def reconcile(client: IBKRClient,
     net_qtys: list[int | None] = []
     cancelled_counts: list[int] = []
 
-    # Per-exchange consent tracking for stale-order cancellation.
+    # Consent tracking.
     cancel_confirm_all: bool = False
     cancel_skip_all: bool = False
     cancel_confirm_exchanges: set[str] = set()
@@ -192,7 +155,6 @@ def reconcile(client: IBKRClient,
         limit_price = row.get("limit_price")
         dollar_alloc = row.get("Dollar Allocation")
 
-        # If essential data is missing, propagate None.
         if pd.isna(conid_raw) or pd.isna(limit_price) or pd.isna(dollar_alloc):
             existing_qtys.append(None)
             pending_qtys.append(None)
@@ -205,8 +167,6 @@ def reconcile(client: IBKRClient,
         limit_price = float(limit_price)
         dollar_alloc = float(dollar_alloc)
 
-        # FX rate: local currency units per 1 USD (1.0 for USD positions).
-        # Non-USD positions without a valid rate are skipped.
         ccy = row.get("currency")
         fx_raw = row.get("fx_rate")
         is_usd = pd.isna(ccy) or str(ccy).upper() == "USD"
@@ -215,7 +175,6 @@ def reconcile(client: IBKRClient,
         elif pd.notna(fx_raw) and float(fx_raw) > 0:
             fx = float(fx_raw)
         else:
-            # Cannot reconcile without a valid exchange rate.
             existing_qtys.append(None)
             pending_qtys.append(None)
             target_qtys.append(None)
@@ -223,8 +182,7 @@ def reconcile(client: IBKRClient,
             cancelled_counts.append(0)
             continue
 
-        # --- Target quantity (signed: positive=BUY, negative=SELL) ---
-        # Dollar Allocation is in USD; limit_price is in local currency.
+        # Target quantity.
         if limit_price > 0:
             local_alloc = abs(dollar_alloc) * fx
             target = math.floor(local_alloc / limit_price)
@@ -232,21 +190,18 @@ def reconcile(client: IBKRClient,
         else:
             target = 0
 
-        # --- Existing position ---
         existing = positions.get(conid, 0)
 
-        # --- Pending orders (cancel stale ones) ---
+        # Pending orders (cancel stale ones).
         pending = 0
         cancelled = 0
         conid_orders = orders_by_conid.get(conid, [])
 
-        # Determine whether we can cancel stale orders for this row.
         mic = row.get("MIC Primary Exchange")
         can_cancel = all_exchanges
         if not can_cancel and pd.notna(mic) and str(mic).strip():
             can_cancel = is_exchange_open(str(mic).strip())
 
-        # Pick the tolerance based on the exchange.
         mic_str = str(mic).strip().upper() if pd.notna(mic) else ""
         tol_pct = (PRICE_TOL_PCT_ILLIQUID
                    if mic_str in _ILLIQUID_MICS
@@ -259,7 +214,6 @@ def reconcile(client: IBKRClient,
                               else None)
             if price_diff_pct is not None and price_diff_pct > tol_pct:
                 if not can_cancel:
-                    # Exchange is closed — keep the stale order as pending.
                     name = row.get("Name", "")
                     print(f"  [{idx + 1}/{total}] Stale order "
                           f"{order['orderId']} for '{name}' kept "
@@ -267,10 +221,8 @@ def reconcile(client: IBKRClient,
                     pending += _signed_order_qty(order)
                     continue
 
-                # --- Consent logic for stale-order cancellation ---
                 name = row.get("Name", "")
 
-                # Check auto-skip first.
                 if cancel_skip_all or mic_str in cancel_skip_exchanges:
                     print(f"  [{idx + 1}/{total}] Stale order "
                           f"{order['orderId']} for '{name}' skipped "
@@ -278,11 +230,8 @@ def reconcile(client: IBKRClient,
                     pending += _signed_order_qty(order)
                     continue
 
-                # Check auto-confirm.
-                if cancel_confirm_all or mic_str in cancel_confirm_exchanges:
-                    auto = True
-                else:
-                    auto = False
+                auto = (cancel_confirm_all
+                        or mic_str in cancel_confirm_exchanges)
 
                 if not auto:
                     print(f"\n  [{idx + 1}/{total}] Stale order "
@@ -305,40 +254,35 @@ def reconcile(client: IBKRClient,
                     elif choice == "X":
                         cancel_skip_exchanges.add(mic_str)
                         pending += _signed_order_qty(order)
-                        print(f"    Skipped.")
                         continue
                     elif choice == "N":
                         cancel_skip_all = True
                         pending += _signed_order_qty(order)
-                        print(f"    Skipped.")
                         continue
                     elif choice == "S":
                         pending += _signed_order_qty(order)
-                        print(f"    Skipped.")
                         continue
                     elif choice != "Y":
-                        # Invalid input — treat as skip for safety.
-                        print(f"    Invalid choice, skipping.")
                         pending += _signed_order_qty(order)
                         continue
 
-                # Proceed with cancellation (Y, A, E, or auto-confirm).
+                # Cancel the stale order via ib_async.
                 try:
-                    client.cancel_order(account_id, order["orderId"])
+                    trade_obj = order.get("trade")
+                    if trade_obj:
+                        ib.cancelOrder(trade_obj.order)
+                    ib.sleep(0.3)
                     auto_tag = " (auto)" if auto else ""
                     print(f"  [{idx + 1}/{total}] Cancelled stale order "
                           f"{order['orderId']} for '{name}' "
                           f"(old price={order_price}, "
                           f"new price={limit_price}){auto_tag}")
                     cancelled += 1
-                    time.sleep(0.2)
                 except Exception as exc:
                     print(f"  [!] Failed to cancel order "
                           f"{order['orderId']}: {exc}")
-                    # Count it as pending since we couldn't cancel.
                     pending += _signed_order_qty(order)
             else:
-                # Order at the correct price – count towards pending.
                 pending += _signed_order_qty(order)
 
         net = target - int(existing) - int(pending)
@@ -357,12 +301,9 @@ def reconcile(client: IBKRClient,
     df["cancelled_orders"] = cancelled_counts
 
     # ------------------------------------------------------------------
-    # Extra positions: IBKR holdings not in the input file.
-    # Treat them as target_qty = 0  ->  need to sell the entire position.
+    # Extra positions not in the input file.
     # ------------------------------------------------------------------
-    df_conids = set(
-        int(c) for c in df["conid"].dropna().unique()
-    )
+    df_conids = set(int(c) for c in df["conid"].dropna().unique())
     extra_conids = [
         cid for cid, qty in positions.items()
         if cid not in df_conids and qty != 0
@@ -374,8 +315,7 @@ def reconcile(client: IBKRClient,
          cancel_confirm_all, cancel_skip_all,
          cancel_confirm_exchanges, cancel_skip_exchanges,
          ) = reconcile_extra_positions(
-            client=client,
-            account_id=account_id,
+            ib=ib,
             extra_conids=extra_conids,
             positions=positions,
             position_meta=position_meta,
@@ -389,13 +329,12 @@ def reconcile(client: IBKRClient,
 
         if extra_rows:
             extra_df = pd.DataFrame(extra_rows)
-            # Align columns with the main df before concatenating.
             for col in df.columns:
                 if col not in extra_df.columns:
                     extra_df[col] = None
             df = pd.concat([df, extra_df[df.columns]], ignore_index=True)
 
-    # Summary – count distinct stocks, not total shares.
+    # Summary.
     all_net = df["net_quantity"].tolist()
     stocks_to_buy = sum(1 for q in all_net if pd.notna(q) and q > 0)
     stocks_to_sell = sum(1 for q in all_net if pd.notna(q) and q < 0)

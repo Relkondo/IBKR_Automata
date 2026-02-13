@@ -1,11 +1,11 @@
 # IBKR Automata
 
-A Python wrapper around the **Interactive Brokers Client Portal API** that automates portfolio-wide limit order placement from a spreadsheet.
+A Python wrapper around the **Interactive Brokers TWS API** (via [ib_async](https://github.com/ib-api-reloaded/ib_async)) that automates portfolio-wide limit order placement from a spreadsheet.
 
 Given an Excel file describing a target portfolio (tickers, allocations, exchanges), IBKR Automata will:
 
-1. Launch the IBKR Client Portal Gateway and authenticate your session.
-2. Resolve every position to an IBKR contract ID — stocks and options, with intelligent fallbacks (company name search, LLM-assisted ticker resolution via OpenAI).
+1. Connect to a running Trader Workstation (TWS) instance.
+2. Resolve every position to an IBKR contract ID — stocks and options, with intelligent fallbacks (fuzzy symbol matching, LLM-assisted ticker resolution via OpenAI).
 3. Fetch live market data (bid, ask, mark price, day high/low), compute limit prices using a configurable parameter, and save the enriched portfolio to `output/Project_Portfolio.csv`.
 4. Reconcile the target portfolio against your existing IBKR positions and pending orders, so only the *net difference* is ordered.
 5. Interactively walk you through each order for confirmation before submission.
@@ -15,7 +15,7 @@ Given an Excel file describing a target portfolio (tickers, allocations, exchang
 ## Prerequisites
 
 - **Python 3.12+** (managed via [pyenv](https://github.com/pyenv/pyenv))
-- **IBKR Client Portal Gateway** — download from [Interactive Brokers](https://www.interactivebrokers.com/en/trading/ib-api.php). Note the installation path; you will configure it in `src/config.py`.
+- **Trader Workstation (TWS)** — download from [Interactive Brokers](https://www.interactivebrokers.com/en/trading/tws.php). TWS must be running and authenticated before launching IBKR Automata. Enable the API in TWS settings: *Edit → Global Configuration → API → Settings* — check "Enable ActiveX and Socket Clients" and note the port (default: 7497 for paper, 7496 for live).
 - **OpenAI API key** (optional) — used as a last-resort fallback to resolve ambiguous ticker symbols. Store the key in a plain text file and point `OPENAI_API_KEY_FILE` in `src/config.py` to it.
 
 ## Setup
@@ -39,8 +39,9 @@ Edit `src/config.py` to match your environment:
 
 | Setting | Description |
 |---|---|
-| `GATEWAY_DIR` | Absolute path to your Client Portal Gateway installation (the directory containing `bin/run.sh`). |
-| `BASE_URL` | Gateway URL. Default: `https://localhost:5001/v1/api`. Adjust the port if you changed it in the gateway config. |
+| `TWS_HOST` | TWS API host. Default: `127.0.0.1`. |
+| `TWS_PORT` | TWS API port. Default: `7497` (paper trading). Use `7496` for live. |
+| `TWS_CLIENT_ID` | Client ID for the API connection. Default: `1`. |
 | `OPENAI_API_KEY_FILE` | Path to a plain-text file containing your OpenAI API key (used for LLM ticker fallback). |
 
 ## Input format
@@ -61,7 +62,7 @@ Place your portfolio Excel file (`.xlsx`) in the `assets/` directory. The file m
 python -m src.main [options]
 ```
 
-On launch, the program starts the Client Portal Gateway and asks you to authenticate via your browser at `https://localhost:5001`. Press Enter once authenticated.
+Before launching, make sure TWS is running and authenticated. The program connects to TWS automatically — no browser authentication step is needed.
 
 ### Modes
 
@@ -72,14 +73,11 @@ On launch, the program starts the Client Portal Gateway and asks you to authenti
 | `noop-recalculate` | Re-use contract IDs from a previously saved `Project_Portfolio.csv` but re-fetch live market data and recompute limit prices. Skips order placement. |
 | `project-portfolio` | Skip steps 2-3 entirely — load an existing `output/Project_Portfolio.csv` and jump straight to the interactive order loop. |
 | `buy-all` | Skip reconciliation — order the full target quantities from `Project_Portfolio` regardless of existing positions or pending orders on IBKR. |
-| `cancel-all-orders` | Cancel every open order on the account and exit. The positions cache is re-invalidated afterwards so it starts reloading. |
-| `get-cache-ready` | Invalidate the gateway's positions cache and record a timestamp. The cache takes ~30 min to fully reload; ordering modes will block until enough time has elapsed. |
+| `cancel-all-orders` | Cancel every open order on the account and exit. |
 | `print-project-vs-actual` | Load `Project_Portfolio.csv` and current IBKR positions, then output an Excel comparison (`output/Project_VS_Actual.xlsx`) showing target vs actual allocations. |
 | `-all-exchanges` | Operate on **all** exchanges regardless of trading hours. By default, only currently open exchanges are considered when placing or cancelling orders. Has no effect with `noop` or `noop-recalculate`. Compatible with all other arguments. |
 
-`noop`, `noop-recalculate`, `project-portfolio`, `cancel-all-orders`, `get-cache-ready`, and `print-project-vs-actual` are mutually exclusive. `buy-all` can be combined with `project-portfolio`.
-
-> **Cache workflow**: Before placing orders for the first time in a session (or after a previous order run), run `get-cache-ready` and wait ~30 minutes for the gateway's positions cache to reload. Ordering modes will automatically check the cache timestamp and refuse to proceed if the cache is too fresh. After placing or cancelling orders, the cache is automatically re-invalidated.
+`noop`, `noop-recalculate`, `project-portfolio`, `cancel-all-orders`, and `print-project-vs-actual` are mutually exclusive. `buy-all` can be combined with `project-portfolio`.
 
 ### Examples
 
@@ -108,9 +106,6 @@ python -m src.main cancel-all-orders
 # Cancel all open orders regardless of exchange hours
 python -m src.main cancel-all-orders -all-exchanges
 
-# Prepare cache for ordering (cancel orders + invalidate + record timestamp)
-python -m src.main get-cache-ready
-
 # Compare Project_Portfolio targets against actual IBKR positions
 python -m src.main print-project-vs-actual
 ```
@@ -121,8 +116,10 @@ For each planned order, you are shown the side, limit price, quantity, and dolla
 
 - **Y** — Confirm and place this order.
 - **A** — Confirm this order *and all subsequent ones* automatically.
+- **E** — Confirm all orders for this exchange automatically.
 - **M** — Modify the quantity, limit price, or side before confirming.
 - **S** — Skip this order.
+- **X** — Skip all orders for this exchange.
 - **Q** — Quit the order loop (orders already placed are kept).
 
 ## Output
@@ -139,7 +136,7 @@ After order placement, a summary table of all placed orders is printed to the te
 
 ## Limit price formula
 
-Prices are computed using a `SPEED_VS_GREED` parameter (default: **10**, configurable in `src/market_data.py`). A higher value produces prices closer to the reference (more patient / "greedier"); a lower value produces more aggressive prices.
+Prices are computed using a `SPEED_VS_GREED` parameter (default: **20**, configurable in `src/market_data.py`). A higher value produces prices closer to the reference (more patient / "greedier"); a lower value produces more aggressive prices.
 
 **Buying:**
 1. If bid available: `bid - (mark - bid) / SPEED_VS_GREED`
@@ -159,15 +156,14 @@ IBKR_Automata/
 ├── output/                  # Generated Project_Portfolio.csv
 ├── src/
 │   ├── main.py              # CLI entry point & workflow orchestration
-│   ├── config.py            # Paths, URLs, and settings
-│   ├── gateway.py           # Gateway subprocess & session keepalive
-│   ├── api_client.py        # IBKR Client Portal API wrapper
+│   ├── config.py            # TWS connection settings & paths
+│   ├── connection.py        # ib_async IB() connection wrapper
 │   ├── portfolio.py         # Excel loading & preprocessing
 │   ├── contracts.py         # Contract ID resolution (stocks, options, fallbacks)
-│   ├── market_data.py       # Market data polling & limit price computation
+│   ├── market_data.py       # Market data snapshots & limit price computation
 │   ├── exchange_hours.py    # Exchange trading hours & open/closed filtering
-│   ├── cache.py             # Cache readiness management (invalidate / check / prepare)
 │   ├── comparison.py        # Project_Portfolio vs actual IBKR positions
+│   ├── extra_positions.py   # Handle IBKR positions not in the input file
 │   ├── reconcile.py         # Reconciliation against IBKR positions & orders
 │   └── orders.py            # Interactive order placement loop
 ├── requirements.txt
