@@ -14,11 +14,51 @@ import math
 import pandas as pd
 from ib_async import IB, Contract
 
+from src.config import MINIMUM_TRADING_AMOUNT
 from src.contracts import exchange_to_mic
 from src.exchange_hours import is_exchange_open
 from src.market_data import (
     _snapshot_batch, _resolve_fx_rate, SNAPSHOT_BATCH_SIZE, FILL_PATIENCE,
 )
+
+
+def compute_net_quantity(
+    target: int | float,
+    existing: float,
+    pending: float,
+    limit_price: float | None = None,
+    fx_rate: float | None = None,
+) -> int:
+    """Compute the net quantity to order and apply the min-trade filter.
+
+    Parameters
+    ----------
+    target : int | float
+        Desired position size (from the project portfolio).
+    existing : float
+        Current IBKR position size.
+    pending : float
+        Signed sum of remaining open-order quantities.
+    limit_price : float | None
+        Estimated limit price in the security's local currency.
+    fx_rate : float | None
+        ``local_currency / USD`` rate (1.0 for USD-denominated).
+
+    Returns
+    -------
+    int
+        Net shares to order.  Zeroed out when the USD value of the
+        trade would be below ``MINIMUM_TRADING_AMOUNT``.
+    """
+    net = round(target) - round(existing) - round(pending)
+    if net == 0:
+        return 0
+    if (limit_price is not None and limit_price > 0
+            and fx_rate is not None and fx_rate > 0):
+        usd_value = abs(net) * limit_price / fx_rate
+        if usd_value < MINIMUM_TRADING_AMOUNT:
+            return 0
+    return net
 
 
 # ------------------------------------------------------------------
@@ -36,8 +76,13 @@ def reconcile_extra_positions(
     cancel_skip_all: bool,
     cancel_confirm_exchanges: set[str],
     cancel_skip_exchanges: set[str],
+    dry_run: bool = False,
 ) -> tuple[list[dict], int, bool, bool, set[str], set[str]]:
     """Process IBKR positions not in the input file.
+
+    When *dry_run* is ``True``, no orders are cancelled — all open
+    orders are counted as pending and synthetic rows are built for
+    read-only display.
 
     Returns
     -------
@@ -109,6 +154,13 @@ def reconcile_extra_positions(
         pos_name = pm.get("name", str(cid))
         raw_exchange = pm.get("exchange", "")
         mic_code = exchange_to_mic(raw_exchange) if raw_exchange else ""
+
+        # In dry-run mode, treat every order as kept (no cancellation).
+        if dry_run:
+            for order in conid_orders:
+                pending_by_conid[cid] = (
+                    pending_by_conid.get(cid, 0) + _signed_qty(order))
+            continue
 
         can_cancel = all_exchanges
         if not can_cancel and mic_code:
@@ -217,6 +269,7 @@ def reconcile_extra_positions(
             "MIC Primary Exchange": mic_code,
             "currency": ccy,
             "fx_rate": fx,
+            "Basket Allocation": 0.0,
             "Dollar Allocation": 0.0,
             "bid": bid,
             "ask": ask_val,
@@ -254,7 +307,10 @@ def reconcile_extra_positions(
             limit_price = round(ask_val, 2)
 
         row_dict["limit_price"] = limit_price
-        row_dict["net_quantity"] = 0 - round(existing) - round(pending)
+        row_dict["net_quantity"] = compute_net_quantity(
+            target=0, existing=existing, pending=pending,
+            limit_price=limit_price, fx_rate=fx,
+        )
 
         extra_rows.append(row_dict)
 

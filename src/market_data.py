@@ -28,7 +28,7 @@ SNAPSHOT_BATCH_SIZE = 50
 # ------------------------------------------------------------------
 # Limit-price tuning
 # ------------------------------------------------------------------
-FILL_PATIENCE = 50  # 0 = cross spread immediately, 100 = sit on bid/ask
+FILL_PATIENCE = 105  # 0 = cross spread immediately, 100 = sit on bid/ask
 
 
 # ------------------------------------------------------------------
@@ -36,16 +36,43 @@ FILL_PATIENCE = 50  # 0 = cross spread immediately, 100 = sit on bid/ask
 # ------------------------------------------------------------------
 
 def _safe_float(val) -> float | None:
-    """Return *val* as float if it's a real number, else None."""
+    """Return *val* as a positive float, or None.
+
+    Filters out ``None``, NaN, Inf, and negative sentinels (ib_async
+    uses ``-1`` to indicate unavailable data).
+    """
     if val is None:
         return None
     try:
         f = float(val)
-        if math.isnan(f) or math.isinf(f):
+        if math.isnan(f) or math.isinf(f) or f < 0:
             return None
         return f
     except (TypeError, ValueError):
         return None
+
+
+def fetch_net_liquidation(ib: IB) -> float:
+    """Fetch the account net liquidation value in USD from IBKR.
+
+    Uses ``ib.accountSummary()`` and looks for the ``NetLiquidation``
+    tag with ``USD`` currency.
+
+    Raises
+    ------
+    RuntimeError
+        If the net liquidation value cannot be found.
+    """
+    summary = ib.accountSummary()
+    for item in summary:
+        if item.tag == "NetLiquidation" and item.currency == "USD":
+            val = float(item.value)
+            if val > 0:
+                return val
+    raise RuntimeError(
+        "Could not retrieve NetLiquidation (USD) from account summary. "
+        "Make sure TWS is connected and has account data loaded."
+    )
 
 
 def _snapshot_batch(
@@ -375,7 +402,7 @@ def fetch_market_data(ib: IB, df: pd.DataFrame) -> pd.DataFrame:
         if fx is None:
             return None
         local_alloc = abs(float(da)) * fx
-        shares = math.floor(local_alloc / float(lp))
+        shares = round(local_alloc / float(lp))
         return shares if float(da) >= 0 else -shares
 
     df["Qty"] = df.apply(_planned_qty, axis=1)

@@ -16,7 +16,7 @@ import pandas as pd
 from ib_async import IB, Trade
 
 from src.exchange_hours import is_exchange_open
-from src.extra_positions import reconcile_extra_positions
+from src.extra_positions import compute_net_quantity, reconcile_extra_positions
 from src.orders import get_account_id
 from src.contracts import exchange_to_mic
 
@@ -111,11 +111,9 @@ def compute_net_quantities(
     """Add ``existing_qty``, ``pending_qty``, ``target_qty``, and
     ``net_quantity`` columns to *df*.
 
-    For each row with a valid ``conid`` and ``Qty``:
-      existing = positions[conid]
-      pending  = sum of signed remaining order quantities
-      target   = Qty (already in the DataFrame)
-      net      = target - existing - pending
+    For each row with a valid ``conid`` and ``Qty``, delegates to
+    ``compute_net_quantity`` which also applies the minimum-trade
+    filter.
 
     Returns a copy of the DataFrame with the new columns.
     """
@@ -143,7 +141,18 @@ def compute_net_quantities(
         for order in orders_by_conid.get(conid, []):
             pending += _signed_order_qty(order)
 
-        net = target - round(existing) - round(pending)
+        # Resolve FX rate for the min-trade filter.
+        lp_raw = row.get("limit_price")
+        fx_raw = row.get("fx_rate")
+        ccy = row.get("currency")
+        is_usd = pd.isna(ccy) or str(ccy).upper() == "USD"
+        lp = float(lp_raw) if pd.notna(lp_raw) else None
+        fx_val = 1.0 if is_usd else (
+            float(fx_raw) if pd.notna(fx_raw) and float(fx_raw) > 0
+            else None
+        )
+
+        net = compute_net_quantity(target, existing, pending, lp, fx_val)
 
         existing_qtys.append(existing)
         pending_qtys.append(pending)
@@ -339,17 +348,21 @@ def reconcile(ib: IB,
         # Read-only: skip cancellation, count all orders as pending.
         df = compute_net_quantities(df, positions, orders_by_conid)
         df["cancelled_orders"] = 0
-        return df
+        cancelled_counts: list[int] = [0] * len(df)
+        cancel_confirm_all = False
+        cancel_skip_all = False
+        cancel_confirm_exchanges: set[str] = set()
+        cancel_skip_exchanges: set[str] = set()
+    else:
+        # Phase 1: Cancel stale orders.
+        (remaining_orders, cancelled_counts,
+         cancel_confirm_all, cancel_skip_all,
+         cancel_confirm_exchanges, cancel_skip_exchanges,
+         ) = _cancel_stale_orders(ib, df, orders_by_conid, all_exchanges)
 
-    # Phase 1: Cancel stale orders.
-    (remaining_orders, cancelled_counts,
-     cancel_confirm_all, cancel_skip_all,
-     cancel_confirm_exchanges, cancel_skip_exchanges,
-     ) = _cancel_stale_orders(ib, df, orders_by_conid, all_exchanges)
-
-    # Phase 2: Compute net quantities with remaining (non-cancelled) orders.
-    df = compute_net_quantities(df, positions, remaining_orders)
-    df["cancelled_orders"] = cancelled_counts
+        # Phase 2: Compute net quantities with remaining orders.
+        df = compute_net_quantities(df, positions, remaining_orders)
+        df["cancelled_orders"] = cancelled_counts
 
     # ------------------------------------------------------------------
     # Extra positions not in the input file.
@@ -376,6 +389,7 @@ def reconcile(ib: IB,
             cancel_skip_all=cancel_skip_all,
             cancel_confirm_exchanges=cancel_confirm_exchanges,
             cancel_skip_exchanges=cancel_skip_exchanges,
+            dry_run=dry_run,
         )
 
         if extra_rows:

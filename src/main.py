@@ -39,7 +39,8 @@ from src.connection import connect
 from src.portfolio import load_portfolio
 from src.contracts import resolve_conids
 from src.market_data import (
-    fetch_market_data, resolve_currencies, save_project_portfolio,
+    fetch_market_data, fetch_net_liquidation, resolve_currencies,
+    save_project_portfolio,
 )
 from src.comparison import generate_project_vs_current
 from src.exchange_hours import filter_df_by_open_exchange
@@ -141,6 +142,11 @@ def main() -> None:
         else:
             # 2. Read portfolio.
             df = load_portfolio()
+
+            # 2b. Fetch net liquidation and compute Dollar Allocation.
+            net_liq = fetch_net_liquidation(ib)
+            print(f"Net Liquidation (USD): ${net_liq:,.2f}\n")
+            df["Dollar Allocation"] = (df["Basket Allocation"] / 100 * net_liq).round(2)
 
             # 3. Resolve conids.
             print("Resolving contract IDs ...\n")

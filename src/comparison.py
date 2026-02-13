@@ -92,6 +92,7 @@ def generate_project_vs_current(ib: IB, df: pd.DataFrame) -> None:
         "Last Price": df.get("last"),
         "FX Rate": df.get("fx_rate"),
         "Qty": df.get("Qty"),
+        "Basket Allocation": df.get("Basket Allocation"),
         "Dollar Allocation": df.get("Dollar Allocation"),
         "Actual Dollar Allocation": df.get("Actual Dollar Allocation"),
         "Current Qty": df.get("existing_qty"),

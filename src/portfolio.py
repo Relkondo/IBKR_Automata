@@ -3,6 +3,10 @@
 Reads the most recent .xlsx from the assets directory, selects the
 required columns, filters out summary / empty rows, and determines
 whether each row is a stock or an option.
+
+The input file uses **Basket Allocation** (percentage of total) instead
+of a dollar amount.  Dollar amounts are computed later by multiplying
+the basket allocation by the account net liquidation value.
 """
 
 import os
@@ -17,7 +21,7 @@ _REQUIRED_COLUMNS = [
     "Ticker",
     "Security Ticker",
     "Name",
-    "Dollar Allocation",
+    "Basket Allocation",
     "MIC Primary Exchange",
 ]
 
@@ -112,9 +116,9 @@ def load_portfolio(xlsx_path: str | None = None) -> pd.DataFrame:
     # Also filter the literal dash used as a placeholder for Cash.
     df = df[df["Name"].astype(str).str.strip() != "-"]
 
-    # Ensure Dollar Allocation is numeric.
-    df["Dollar Allocation"] = pd.to_numeric(
-        df["Dollar Allocation"], errors="coerce"
+    # Ensure Basket Allocation is numeric (percentage of total).
+    df["Basket Allocation"] = pd.to_numeric(
+        df["Basket Allocation"], errors="coerce"
     )
 
     # Derived columns.
