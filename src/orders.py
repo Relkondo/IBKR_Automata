@@ -17,6 +17,7 @@ from src.cancel import (
     CancelState, resolve_cancel_decision, execute_cancel,
 )
 from src.config import MAXIMUM_AMOUNT_AUTOMATIC_ORDER
+from src.connection import ensure_connected
 from src.contracts import exchange_to_mic
 from src.exchange_hours import is_exchange_open
 from src.market_data import get_fx, snap_to_tick
@@ -513,6 +514,8 @@ def run_order_loop(ib: IB, df: pd.DataFrame) -> list[dict]:
 
     Returns a list of summary records for successfully placed orders.
     """
+    ensure_connected(ib)
+
     placed_orders: list[dict] = []
     deferred_orders: list[_OrderParams] = []
     state = _AutoState()

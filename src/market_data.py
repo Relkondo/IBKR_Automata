@@ -21,6 +21,7 @@ import pandas as pd
 from ib_async import IB, Contract, Forex
 
 from src.config import FILL_PATIENCE, OUTPUT_DIR, PROJECT_PORTFOLIO_COLUMNS
+from src.connection import ensure_connected
 
 
 # ==================================================================
@@ -553,6 +554,8 @@ def fetch_market_data(ib: IB, df: pd.DataFrame) -> pd.DataFrame:
 
     Only rows with a valid (non-null) conid are queried.
     """
+    ensure_connected(ib)
+
     all_conids = (
         df.loc[df["conid"].notna(), "conid"].astype(int).tolist()
     )

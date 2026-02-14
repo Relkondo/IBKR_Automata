@@ -42,6 +42,23 @@ def suppress_errors(*codes: int):
 
 
 # ==================================================================
+# Connection health
+# ==================================================================
+
+def ensure_connected(ib: IB) -> None:
+    """Raise ``RuntimeError`` if the TWS connection is broken.
+
+    Call this before any operation whose empty result would be
+    silently misinterpreted (e.g. fetching positions or orders).
+    """
+    if not ib.isConnected():
+        raise RuntimeError(
+            "TWS connection lost. Cannot continue — results would be "
+            "unreliable.  Please restart the program with TWS running."
+        )
+
+
+# ==================================================================
 # Connection
 # ==================================================================
 

@@ -14,6 +14,7 @@ import pandas as pd
 from ib_async import IB
 
 from src.config import OUTPUT_DIR
+from src.connection import ensure_connected
 from src.market_data import get_fx
 
 
@@ -53,6 +54,7 @@ def generate_project_vs_current(ib: IB, df: pd.DataFrame) -> None:
       3. Write ``output/Project_VS_Current.xlsx``.
     """
     # --- 1. Fetch market values ---
+    ensure_connected(ib)
     print("Fetching current market values ...")
     portfolio_items = ib.portfolio()
     print(f"  Found {len(portfolio_items)} portfolio item(s).\n")

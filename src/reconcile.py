@@ -20,6 +20,7 @@ from src.cancel import (
     resolve_cancel_decision, execute_cancel,
 )
 from src.config import STALE_ORDER_TOL_PCT, STALE_ORDER_TOL_PCT_ILLIQUID
+from src.connection import ensure_connected
 from src.exchange_hours import is_exchange_open
 from src.extra_positions import compute_net_quantity, reconcile_extra_positions
 from src.market_data import get_fx
@@ -142,20 +143,16 @@ def compute_net_quantities(
         pending_qtys.append(pending)
 
         if pd.isna(qty_raw):
-            # No projected Qty (e.g. missing market data), but we
-            # can still show current positions and pending orders.
             target_qtys.append(None)
             net_qtys.append(None)
             continue
-
-        target = round(float(qty_raw))
 
         lp_raw = row.get("limit_price")
         lp = float(lp_raw) if pd.notna(lp_raw) else None
         fx_val = get_fx(row)
 
+        target = round(float(qty_raw))
         net = compute_net_quantity(target, existing, pending, lp, fx_val)
-
         target_qtys.append(target)
         net_qtys.append(net)
 
@@ -304,6 +301,8 @@ def reconcile(ib: IB,
     2. Compute net quantities using ``compute_net_quantities``.
     3. Handle extra IBKR positions not in the input file.
     """
+    ensure_connected(ib)
+
     print("Fetching current IBKR positions ...")
     positions, position_meta = _fetch_positions(ib)
     print(f"  Found {len(positions)} positions.\n")
