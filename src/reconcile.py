@@ -124,7 +124,7 @@ def compute_net_quantities(
         conid_raw = row.get("conid")
         qty_raw = row.get("Qty")
 
-        if pd.isna(conid_raw) or pd.isna(qty_raw):
+        if pd.isna(conid_raw):
             existing_qtys.append(None)
             pending_qtys.append(None)
             target_qtys.append(None)
@@ -132,12 +132,23 @@ def compute_net_quantities(
             continue
 
         conid = int(conid_raw)
-        target = round(float(qty_raw))
         existing = positions.get(conid, 0)
 
         pending = 0.0
         for order in orders_by_conid.get(conid, []):
             pending += signed_order_qty(order)
+
+        existing_qtys.append(existing)
+        pending_qtys.append(pending)
+
+        if pd.isna(qty_raw):
+            # No projected Qty (e.g. missing market data), but we
+            # can still show current positions and pending orders.
+            target_qtys.append(None)
+            net_qtys.append(None)
+            continue
+
+        target = round(float(qty_raw))
 
         lp_raw = row.get("limit_price")
         lp = float(lp_raw) if pd.notna(lp_raw) else None
@@ -145,8 +156,6 @@ def compute_net_quantities(
 
         net = compute_net_quantity(target, existing, pending, lp, fx_val)
 
-        existing_qtys.append(existing)
-        pending_qtys.append(pending)
         target_qtys.append(target)
         net_qtys.append(net)
 
