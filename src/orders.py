@@ -19,7 +19,7 @@ from src.cancel import (
 from src.config import MAXIMUM_AMOUNT_AUTOMATIC_ORDER
 from src.contracts import exchange_to_mic
 from src.exchange_hours import is_exchange_open
-from src.market_data import snap_to_tick
+from src.market_data import _get_fx, snap_to_tick
 
 
 @dataclass
@@ -57,9 +57,9 @@ class _OrderParams:
     mic_str: str
 
 
-# ------------------------------------------------------------------
+# ==================================================================
 # Account
-# ------------------------------------------------------------------
+# ==================================================================
 
 def get_account_id(ib: IB) -> str:
     """Retrieve the first managed account ID."""
@@ -71,9 +71,9 @@ def get_account_id(ib: IB) -> str:
     return account_id
 
 
-# ------------------------------------------------------------------
+# ==================================================================
 # Cancel all orders
-# ------------------------------------------------------------------
+# ==================================================================
 
 def cancel_all_orders(ib: IB,
                       all_exchanges: bool = True) -> None:
@@ -82,7 +82,7 @@ def cancel_all_orders(ib: IB,
     When *all_exchanges* is ``False``, only cancel orders whose
     exchange is currently open.
     """
-    account_id = get_account_id(ib)
+    get_account_id(ib)
 
     print("Fetching open orders ...")
     open_trades = ib.openTrades()
@@ -150,9 +150,9 @@ def cancel_all_orders(ib: IB,
     print(f"\nDone: {', '.join(parts)}.\n")
 
 
-# ------------------------------------------------------------------
+# ==================================================================
 # Order helpers
-# ------------------------------------------------------------------
+# ==================================================================
 
 def _format_currency(value: float) -> str:
     return f"${value:,.2f}"
@@ -167,9 +167,9 @@ def _place_order(ib: IB, contract: Contract, order: LimitOrder,
     return trade
 
 
-# ------------------------------------------------------------------
+# ==================================================================
 # Interactive loop
-# ------------------------------------------------------------------
+# ==================================================================
 
 def _compute_usd_amount(limit_price: float, quantity: int,
                         multiplier: int, fx: float) -> float:
@@ -405,20 +405,9 @@ def _place_single_order(
     return "next"
 
 
-# ------------------------------------------------------------------
+# ==================================================================
 # Order-params preparation
-# ------------------------------------------------------------------
-
-def _resolve_fx(row: pd.Series) -> float | None:
-    """Extract the FX rate from a row. Returns 1.0 for USD, None if missing."""
-    ccy = row.get("currency")
-    fx_raw = row.get("fx_rate")
-    if pd.isna(ccy) or str(ccy).upper() == "USD":
-        return 1.0
-    if pd.notna(fx_raw) and float(fx_raw) > 0:
-        return float(fx_raw)
-    return None
-
+# ==================================================================
 
 def _prepare_order_params(
     ib: IB,
@@ -439,7 +428,7 @@ def _prepare_order_params(
     dollar_alloc_raw = row.get("Dollar Allocation")
     limit_price_raw = row.get("limit_price")
     ccy = row.get("currency")
-    fx = _resolve_fx(row)
+    fx = _get_fx(row)
 
     # --- Collect skip reasons -----------------------------------------
     skip_reasons: list[str] = []
@@ -528,9 +517,9 @@ def _prepare_order_params(
     )
 
 
-# ------------------------------------------------------------------
+# ==================================================================
 # Main loop
-# ------------------------------------------------------------------
+# ==================================================================
 
 def run_order_loop(ib: IB, df: pd.DataFrame) -> list[dict]:
     """Iterate over the portfolio and interactively place orders.

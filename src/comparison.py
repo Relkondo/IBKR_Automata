@@ -14,17 +14,7 @@ import pandas as pd
 from ib_async import IB
 
 from src.config import OUTPUT_DIR
-
-
-def _resolve_fx(row: pd.Series) -> float | None:
-    """Return the USD/local FX rate: 1.0 for USD, the rate for foreign, None if missing."""
-    ccy = row.get("currency")
-    fx_raw = row.get("fx_rate")
-    if pd.isna(ccy) or str(ccy).upper() == "USD":
-        return 1.0
-    if pd.notna(fx_raw) and float(fx_raw) > 0:
-        return float(fx_raw)
-    return None
+from src.market_data import _get_fx
 
 
 def _market_value_usd(
@@ -79,7 +69,7 @@ def generate_project_vs_current(ib: IB, df: pd.DataFrame) -> None:
     actual_vs_current: list[float | None] = []
 
     for _, row in df.iterrows():
-        fx = _resolve_fx(row)
+        fx = _get_fx(row)
         mkt_usd = _market_value_usd(row.get("conid"), mkt_values, fx)
 
         current_dollar_amounts.append(mkt_usd)
