@@ -22,8 +22,7 @@ from src.cancel import (
 from src.config import STALE_ORDER_TOL_PCT, STALE_ORDER_TOL_PCT_ILLIQUID
 from src.exchange_hours import is_exchange_open
 from src.extra_positions import compute_net_quantity, reconcile_extra_positions
-from src.market_data import _get_fx
-from src.orders import get_account_id
+from src.market_data import get_fx
 
 
 # ==================================================================
@@ -142,7 +141,7 @@ def compute_net_quantities(
 
         lp_raw = row.get("limit_price")
         lp = float(lp_raw) if pd.notna(lp_raw) else None
-        fx_val = _get_fx(row)
+        fx_val = get_fx(row)
 
         net = compute_net_quantity(target, existing, pending, lp, fx_val)
 
@@ -296,8 +295,6 @@ def reconcile(ib: IB,
     2. Compute net quantities using ``compute_net_quantities``.
     3. Handle extra IBKR positions not in the input file.
     """
-    get_account_id(ib)
-
     print("Fetching current IBKR positions ...")
     positions, position_meta = _fetch_positions(ib)
     print(f"  Found {len(positions)} positions.\n")

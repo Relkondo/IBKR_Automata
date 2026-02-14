@@ -1,13 +1,13 @@
-"""Interactive order placement with user confirmation via ib_async.
+"""Order placement, cancellation, and interactive confirmation via ib_async.
 
-For each row in the portfolio table the user is prompted to confirm,
-modify, skip, or quit.  Placed orders are tracked and a summary is
-printed at the end.
+Provides the ``cancel_all_orders`` bulk-cancellation command and the
+interactive ``run_order_loop`` for placing orders.  For each row in the
+portfolio table the user is prompted to confirm, modify, skip, or quit.
+Placed orders are tracked and a summary is printed at the end.
 """
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass, field
 
 import pandas as pd
@@ -19,7 +19,7 @@ from src.cancel import (
 from src.config import MAXIMUM_AMOUNT_AUTOMATIC_ORDER
 from src.contracts import exchange_to_mic
 from src.exchange_hours import is_exchange_open
-from src.market_data import _get_fx, snap_to_tick
+from src.market_data import get_fx, snap_to_tick
 
 
 @dataclass
@@ -53,22 +53,8 @@ class _OrderParams:
     is_foreign: bool
     fx: float
     dollar_alloc: float
-    net_qty_raw: object  # float | NaN | None (pandas scalar)
+    net_qty_raw: float | None  # pandas scalar: set by reconciliation, NaN/None otherwise
     mic_str: str
-
-
-# ==================================================================
-# Account
-# ==================================================================
-
-def get_account_id(ib: IB) -> str:
-    """Retrieve the first managed account ID."""
-    accounts = ib.managedAccounts()
-    if not accounts:
-        raise RuntimeError("No managed accounts returned by TWS.")
-    account_id = accounts[0]
-    print(f"Using account: {account_id}\n")
-    return account_id
 
 
 # ==================================================================
@@ -76,14 +62,12 @@ def get_account_id(ib: IB) -> str:
 # ==================================================================
 
 def cancel_all_orders(ib: IB,
-                      all_exchanges: bool = True) -> None:
+                      all_exchanges: bool = False) -> None:
     """Fetch every open order and attempt to cancel each one.
 
-    When *all_exchanges* is ``False``, only cancel orders whose
-    exchange is currently open.
+    When *all_exchanges* is ``False`` (the default), only cancel
+    orders whose exchange is currently open.
     """
-    get_account_id(ib)
-
     print("Fetching open orders ...")
     open_trades = ib.openTrades()
 
@@ -120,8 +104,7 @@ def cancel_all_orders(ib: IB,
 
         order_desc = f"{side} {remaining} {ticker} @ {price}"
         header = (
-            f"\n  Order {oid}  {order_desc}"
-            f"  (exchange: {mic or '?'})\n"
+            f"\n  Order {oid}  {order_desc}\n"
             f"  Exchange: {mic or '?'}"
         )
 
@@ -154,8 +137,12 @@ def cancel_all_orders(ib: IB,
 # Order helpers
 # ==================================================================
 
-def _format_currency(value: float) -> str:
-    return f"${value:,.2f}"
+def _format_currency(value: float, ccy: str = "USD") -> str:
+    """Format a monetary value.  Uses ``$`` for USD, appends the
+    currency code for everything else."""
+    if ccy == "USD":
+        return f"${value:,.2f}"
+    return f"{value:,.2f} {ccy}"
 
 
 def _place_order(ib: IB, contract: Contract, order: LimitOrder,
@@ -226,7 +213,7 @@ def _prompt_modify(p: _OrderParams) -> None:
             print("    Invalid number, keeping original.")
 
     new_price = input(
-        f"  New limit price [{_format_currency(p.limit_price)}]: "
+        f"  New limit price [{_format_currency(p.limit_price, p.ccy_label)}]: "
     ).strip()
     if new_price:
         try:
@@ -344,9 +331,9 @@ def _place_single_order(
                     if adjusted is not None:
                         print(
                             f"    Price "
-                            f"{_format_currency(p.limit_price)} "
+                            f"{_format_currency(p.limit_price, p.ccy_label)} "
                             f"rejected (tick-size). Retrying at "
-                            f"{_format_currency(adjusted)} …")
+                            f"{_format_currency(adjusted, p.ccy_label)} …")
                         p.limit_price = adjusted
                         continue
                     print(f"    [!] Tick-size error but could not "
@@ -428,7 +415,7 @@ def _prepare_order_params(
     dollar_alloc_raw = row.get("Dollar Allocation")
     limit_price_raw = row.get("limit_price")
     ccy = row.get("currency")
-    fx = _get_fx(row)
+    fx = get_fx(row)
 
     # --- Collect skip reasons -----------------------------------------
     skip_reasons: list[str] = []
@@ -471,7 +458,7 @@ def _prepare_order_params(
     else:
         side = "SELL" if dollar_alloc < 0 else "BUY"
         local_alloc = abs(dollar_alloc) * fx
-        quantity = math.floor(local_alloc / (limit_price * multiplier))
+        quantity = round(local_alloc / (limit_price * multiplier))
         if quantity <= 0:
             print(f"{label} Skipping '{name}' ({ticker}) -- "
                   "computed quantity is 0.")
@@ -526,7 +513,6 @@ def run_order_loop(ib: IB, df: pd.DataFrame) -> list[dict]:
 
     Returns a list of summary records for successfully placed orders.
     """
-    get_account_id(ib)
     placed_orders: list[dict] = []
     deferred_orders: list[_OrderParams] = []
     state = _AutoState()

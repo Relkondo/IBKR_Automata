@@ -46,7 +46,7 @@ from src.market_data import (
 from src.comparison import generate_project_vs_current
 from src.exchange_hours import filter_df_by_open_exchange
 from src.orders import (
-    cancel_all_orders, get_account_id, run_order_loop, print_order_summary,
+    cancel_all_orders, run_order_loop, print_order_summary,
 )
 from src.reconcile import reconcile
 
@@ -82,9 +82,14 @@ def main() -> None:
               "'cancel-all-orders', and 'print-project-vs-current' "
               "are mutually exclusive.")
         sys.exit(1)
-    if buy_all and print_comparison:
-        print("Error: 'buy-all' and 'print-project-vs-current' cannot be "
-              "combined (the comparison requires reconciliation data).")
+    if buy_all and (noop or noop_recalc or cancel_all or print_comparison):
+        incompatible = [name for flag, name in [
+            (noop, "noop"), (noop_recalc, "noop-recalculate"),
+            (cancel_all, "cancel-all-orders"),
+            (print_comparison, "print-project-vs-current"),
+        ] if flag]
+        print(f"Error: 'buy-all' cannot be combined with "
+              f"{', '.join(repr(n) for n in incompatible)}.")
         sys.exit(1)
 
     if print_comparison:

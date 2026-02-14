@@ -40,7 +40,7 @@ def _latest_xlsx(directory: str) -> str:
 
 # Regex that matches option-style tickers, e.g. "QQQ US 02/27/26 P600 Equity"
 # Pattern: UNDERLYING <country> <MM/DD/YY> <C|P><strike> <suffix>
-_OPT_TICKER_RE = re.compile(
+OPT_TICKER_RE = re.compile(
     r"^(?P<underlying>[A-Z]+)"           # underlying symbol
     r"\s+[A-Z]{2}"                       # country code (ignored)
     r"\s+(?P<month>\d{2})/(?P<day>\d{2})/(?P<year>\d{2})"  # MM/DD/YY
@@ -56,7 +56,7 @@ def _is_option(row: pd.Series) -> bool:
     ticker = str(row.get("Ticker", "") or "")
     if "Calls on" in name or "Puts on" in name:
         return True
-    if _OPT_TICKER_RE.match(ticker.strip()):
+    if OPT_TICKER_RE.match(ticker.strip()):
         return True
     return False
 

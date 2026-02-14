@@ -51,7 +51,7 @@ def _safe_float(val) -> float | None:
 SNAPSHOT_BATCH_SIZE = 50
 
 
-def _snapshot_batch(
+def snapshot_batch(
     ib: IB, contracts: list[Contract],
 ) -> dict[int, dict]:
     """Request snapshot tickers for a batch of contracts.
@@ -240,7 +240,7 @@ def _snap_limit_price(row, ib: IB) -> float | None:
 # Limit-price calculation
 # ==================================================================
 
-def _calc_limit_price(row, *, is_sell: bool | None = None) -> float | None:
+def calc_limit_price(row, *, is_sell: bool | None = None) -> float | None:
     """Compute the limit price for a single row.
 
     Uses a spread-based formula controlled by ``FILL_PATIENCE`` (0-100):
@@ -304,7 +304,7 @@ def _calc_limit_price(row, *, is_sell: bool | None = None) -> float | None:
 # Quantity & allocation helpers
 # ==================================================================
 
-def _get_fx(row) -> float | None:
+def get_fx(row) -> float | None:
     """Return the FX rate for a row: 1.0 for USD, the rate for foreign, None if missing."""
     ccy = row.get("currency")
     fx = row.get("fx_rate")
@@ -326,7 +326,7 @@ def _planned_qty(row) -> int | None:
     da = row.get("Dollar Allocation")
     if pd.isna(lp) or pd.isna(da) or float(lp) <= 0:
         return None
-    fx = _get_fx(row)
+    fx = get_fx(row)
     if fx is None:
         return None
     local_alloc = abs(float(da)) * fx
@@ -339,7 +339,7 @@ def _actual_dollar_alloc(row) -> float | None:
     """Compute the actual dollar allocation from limit price, qty, and FX."""
     lp = row.get("limit_price")
     qty = row.get("Qty")
-    fx = _get_fx(row)
+    fx = get_fx(row)
     if pd.isna(lp) or pd.isna(qty) or fx is None:
         return None
     return round(
@@ -407,7 +407,7 @@ def _fetch_web_fx_rate(ccy: str) -> float | None:
     return None
 
 
-def _resolve_fx_rate(ib: IB, ccy: str) -> float | None:
+def resolve_fx_rate(ib: IB, ccy: str) -> float | None:
     """Obtain the USD -> *ccy* exchange rate.
 
     Strategy (in order):
@@ -500,7 +500,7 @@ def resolve_currencies(ib: IB, df: pd.DataFrame) -> pd.DataFrame:
 
     fx_rates: dict[str, float] = {"USD": 1.0}
     for ccy in sorted(unique_currencies):
-        resolved = _resolve_fx_rate(ib, ccy)
+        resolved = resolve_fx_rate(ib, ccy)
         if resolved is not None:
             fx_rates[ccy] = resolved
 
@@ -588,7 +588,7 @@ def fetch_market_data(ib: IB, df: pd.DataFrame) -> pd.DataFrame:
         batch_num = i // SNAPSHOT_BATCH_SIZE + 1
         print(f"  Batch {batch_num}/{total_batches} "
               f"({len(batch)} contracts) …")
-        snapshot.update(_snapshot_batch(ib, batch))
+        snapshot.update(snapshot_batch(ib, batch))
 
     # 4. Map snapshot data to DataFrame columns.
     bids, asks, lasts, closes, highs, lows = [], [], [], [], [], []
@@ -615,7 +615,7 @@ def fetch_market_data(ib: IB, df: pd.DataFrame) -> pd.DataFrame:
     df["day_low"] = lows
 
     # 5. Compute limit prices and snap to valid tick increments.
-    df["limit_price"] = df.apply(_calc_limit_price, axis=1)
+    df["limit_price"] = df.apply(calc_limit_price, axis=1)
     df["limit_price"] = df.apply(_snap_limit_price, axis=1, ib=ib)
 
     # 6. Compute planned quantities and actual dollar allocations.

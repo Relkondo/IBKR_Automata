@@ -14,7 +14,7 @@ import time
 import pandas as pd
 from ib_async import IB, Stock, Option
 
-from src.portfolio import _OPT_TICKER_RE
+from src.portfolio import OPT_TICKER_RE
 
 
 # ==================================================================
@@ -70,8 +70,7 @@ for _mic, _preferred in [("XFRA", "FWB2"), ("XETR", "IBIS2")]:
 def exchange_to_mic(exchange: str) -> str:
     """Convert an IBKR exchange abbreviation to its primary MIC code.
 
-    Returns the first (primary) MIC.  For multi-MIC comparisons use
-    ``_mics_of`` internally.
+    Returns the first (primary) MIC for the given exchange.
     """
     mics = _IBKR_TO_MIC.get(exchange.upper())
     return mics[0] if mics else exchange.upper()
@@ -286,7 +285,7 @@ def _resolve_option(
     clean = re.sub(
         r"\s+(?:Equity|Index)$", "", ticker.strip(), flags=re.IGNORECASE,
     )
-    m = _OPT_TICKER_RE.match(clean)
+    m = OPT_TICKER_RE.match(clean)
     if not m:
         print(f"    [!] Cannot parse option ticker '{ticker}'")
         return None

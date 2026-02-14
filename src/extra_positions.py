@@ -23,7 +23,7 @@ from src.config import MINIMUM_TRADING_AMOUNT
 from src.contracts import exchange_to_mic
 from src.exchange_hours import is_exchange_open
 from src.market_data import (
-    _snapshot_batch, _calc_limit_price, _resolve_fx_rate, snap_to_tick,
+    snapshot_batch, calc_limit_price, resolve_fx_rate, snap_to_tick,
     SNAPSHOT_BATCH_SIZE,
 )
 
@@ -80,6 +80,7 @@ class _ExtraInfo:
     fx_rate: float | None
     market_rules: str
     long_name: str
+    is_option: bool = False
 
 
 # ==================================================================
@@ -106,6 +107,7 @@ def _fetch_extra_metadata(
 
         if qc:
             currency = (qc.currency or "USD").upper()
+            is_option = qc.secType == "OPT"
             market_rules = ""
             long_name = fallback_name
             try:
@@ -118,6 +120,7 @@ def _fetch_extra_metadata(
                 pass
         else:
             currency = "USD"
+            is_option = False
             market_rules = ""
             long_name = fallback_name
 
@@ -127,13 +130,14 @@ def _fetch_extra_metadata(
             fx_rate=None,       # filled below
             market_rules=market_rules,
             long_name=long_name,
+            is_option=is_option,
         )
 
     # Resolve FX rates for unique non-USD currencies.
     unique_ccys = {ei.currency for ei in info.values() if ei.currency != "USD"}
     fx_rates: dict[str, float] = {"USD": 1.0}
     for ccy in sorted(unique_ccys):
-        resolved = _resolve_fx_rate(ib, ccy)
+        resolved = resolve_fx_rate(ib, ccy)
         if resolved is not None:
             fx_rates[ccy] = resolved
 
@@ -166,7 +170,7 @@ def _fetch_extra_snapshots(
         batch_num = i // SNAPSHOT_BATCH_SIZE + 1
         print(f"  Extra batch {batch_num}/{total_batches} "
               f"({len(batch)} contracts) …")
-        snapshot.update(_snapshot_batch(ib, batch))
+        snapshot.update(snapshot_batch(ib, batch))
 
     return snapshot
 
@@ -300,7 +304,7 @@ def _build_extra_rows(
             "close": snap.get("close"),
             "day_high": snap.get("high"),
             "day_low": snap.get("low"),
-            "is_option": False,
+            "is_option": ei.is_option,
             "existing_qty": existing,
             "pending_qty": pending,
             "target_qty": 0,
@@ -309,7 +313,7 @@ def _build_extra_rows(
 
         # Compute limit price using the shared spread-based formula.
         is_sell = existing > 0
-        limit_price = _calc_limit_price(row_dict, is_sell=is_sell)
+        limit_price = calc_limit_price(row_dict, is_sell=is_sell)
 
         # Snap limit price to valid tick increment.
         if limit_price is not None and ei.market_rules:

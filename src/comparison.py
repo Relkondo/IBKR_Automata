@@ -14,7 +14,7 @@ import pandas as pd
 from ib_async import IB
 
 from src.config import OUTPUT_DIR
-from src.market_data import _get_fx
+from src.market_data import get_fx
 
 
 def _market_value_usd(
@@ -69,7 +69,7 @@ def generate_project_vs_current(ib: IB, df: pd.DataFrame) -> None:
     actual_vs_current: list[float | None] = []
 
     for _, row in df.iterrows():
-        fx = _get_fx(row)
+        fx = get_fx(row)
         mkt_usd = _market_value_usd(row.get("conid"), mkt_values, fx)
 
         current_dollar_amounts.append(mkt_usd)

@@ -2,7 +2,8 @@
 
 Provides a thin wrapper that establishes a connection to a running
 Trader Workstation instance and returns the ``IB`` handle used by
-all other modules.
+all other modules.  Also provides a ``suppress_errors`` context
+manager for silencing specific IBKR error codes during cancellation.
 """
 
 from __future__ import annotations
@@ -74,5 +75,7 @@ def connect() -> IB:
     ib.reqMarketDataType(3)
 
     accounts = ib.managedAccounts()
+    if not accounts:
+        raise RuntimeError("No managed accounts returned by TWS.")
     print(f"Connected to TWS (account: {accounts[0]})\n")
     return ib

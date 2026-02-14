@@ -4,9 +4,8 @@ Provides the interactive cancel/skip prompt and execution helpers used
 by stale-order cancellation (reconcile), extra-position cancellation,
 and cancel-all-orders.
 
-The ``CancelState`` dataclass replaces the loose boolean/set variables
-that were previously threaded through multiple function signatures and
-return tuples.
+``CancelState`` tracks per-exchange user consent so that "Cancel All"
+or "Skip All" decisions carry across items within the same batch.
 """
 
 from __future__ import annotations
