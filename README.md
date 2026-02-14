@@ -36,11 +36,16 @@ pip install -r requirements.txt
 
 Edit `src/config.py` to match your environment:
 
-| Setting | Description |
-|---|---|
-| `TWS_HOST` | TWS API host. Default: `127.0.0.1`. |
-| `TWS_PORT` | TWS API port. Default: `7497` (paper trading). Use `7496` for live. |
-| `TWS_CLIENT_ID` | Client ID for the API connection. Default: `1`. |
+| Setting | Default | Description |
+|---|---|---|
+| `TWS_HOST` | `127.0.0.1` | TWS API host. |
+| `TWS_PORT` | `7497` | TWS API port (`7497` paper, `7496` live). |
+| `TWS_CLIENT_ID` | `1` | Client ID for the API connection. |
+| `FILL_PATIENCE` | `20` | Limit-price aggressiveness (0 = cross spread, 100 = passive). See [Limit price formula](#limit-price-formula). |
+| `MINIMUM_TRADING_AMOUNT` | `100` | USD — net orders below this value are skipped. |
+| `MAXIMUM_AMOUNT_AUTOMATIC_ORDER` | `10,000` | USD — auto-confirmed orders above this are deferred for manual approval. |
+| `STALE_ORDER_TOL_PCT` | `0.005` | Fraction — stale-order price tolerance (0.5 %). |
+| `STALE_ORDER_TOL_PCT_ILLIQUID` | `0.05` | Fraction — wider tolerance for illiquid exchanges (5 %). |
 
 ## Input format
 
@@ -136,7 +141,7 @@ After order placement, a summary table of all placed orders is printed to the te
 
 ## Limit price formula
 
-Limit prices are computed using a `FILL_PATIENCE` parameter (default: **20**, configurable in `src/market_data.py`). The value ranges from 0 to 100 and controls how aggressively the order crosses the bid/ask spread.
+Limit prices are computed using the `FILL_PATIENCE` parameter (default: **20**, configurable in `src/config.py`). The value ranges from 0 to 100 and controls how aggressively the order crosses the bid/ask spread.
 
 **Buying:**
 
@@ -168,12 +173,13 @@ IBKR_Automata/
 ├── output/                  # Generated Project_Portfolio.csv
 ├── src/
 │   ├── main.py              # CLI entry point & workflow orchestration
-│   ├── config.py            # TWS connection settings & paths
+│   ├── config.py            # Centralized settings (TWS, thresholds, tuning)
 │   ├── connection.py        # ib_async IB() connection wrapper
 │   ├── portfolio.py         # Excel loading & preprocessing
 │   ├── contracts.py         # Contract ID resolution (stocks, options, fallbacks)
-│   ├── market_data.py       # Market data snapshots & limit price computation
+│   ├── market_data.py       # Market data, limit prices, FX & tick-size helpers
 │   ├── exchange_hours.py    # Exchange trading hours & open/closed filtering
+│   ├── cancel.py            # Shared order-cancellation logic & interactive prompt
 │   ├── comparison.py        # Project_Portfolio vs current IBKR positions
 │   ├── extra_positions.py   # Handle IBKR positions not in the input file
 │   ├── reconcile.py         # Reconciliation against IBKR positions & orders
