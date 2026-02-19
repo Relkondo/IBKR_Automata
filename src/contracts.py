@@ -148,17 +148,39 @@ def _query_all_redirects(
     """Try **all** redirect exchanges for *symbol*.
 
     Continues through every redirect MIC so that all available
-    listings are discovered.
+    listings are discovered.  For exchanges that can't be queried
+    directly (e.g. OTC/PINK), falls back to a SMART query and
+    matches by ``primaryExchange``.
 
     Returns a list of ``(ContractDetails, effective_mic)`` tuples.
     """
     hits: list[tuple] = []
+    missed_mics: list[str] = []
+
     for redirect_mic in redirects:
+        found = False
         for exchange in _MIC_TO_IBKR.get(redirect_mic, []):
             details = _get_listings(ib, symbol, exchange)
             if details:
                 hits.append((details[0], redirect_mic))
+                found = True
                 break
+        if not found:
+            missed_mics.append(redirect_mic)
+
+    # Some exchanges (notably OTC/PINK) can't be queried directly —
+    # the stock exists but reqContractDetails with exchange="PINK"
+    # returns nothing.  Fall back to SMART and match by primaryExchange.
+    if missed_mics:
+        smart_details = _get_listings(ib, symbol)
+        for cd in smart_details:
+            prim = exchange_to_mic(cd.contract.primaryExchange or "")
+            if prim in missed_mics:
+                hits.append((cd, prim))
+                missed_mics.remove(prim)
+                if not missed_mics:
+                    break
+
     return hits
 
 

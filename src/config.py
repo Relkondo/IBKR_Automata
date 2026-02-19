@@ -22,7 +22,7 @@ MAXIMUM_AMOUNT_AUTOMATIC_ORDER = 10_000  # USD – auto-confirmed orders above t
 #   0   = cross the spread fully (fills immediately)
 #   50  = midpoint (balanced)
 #   100 = sit on the passive side (cheapest, may not fill)
-FILL_PATIENCE = 80
+FILL_PATIENCE = 120
 
 # --- Stale-order price tolerance ---
 # When reconciling, an existing order is considered "stale" (and eligible
