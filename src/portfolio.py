@@ -14,7 +14,9 @@ import re
 
 import pandas as pd
 
-from src.config import ASSETS_DIR
+from src.config import (
+    ASSETS_DIR, OPTION_TICKER_REDIRECTS, STOCK_TICKER_REDIRECTS,
+)
 
 # Columns we need from the Excel file (header row names).
 _REQUIRED_COLUMNS = [
@@ -77,6 +79,87 @@ def _clean_ticker(row: pd.Series) -> str:
     ).strip()
 
 
+def _ticker_prefix(row: pd.Series) -> str:
+    """Return the ticker prefix used for redirection matching.
+
+    Options use the Ticker column; stocks use Security Ticker
+    (falling back to Ticker).  Only the part before the first space
+    is returned, upper-cased.
+    """
+    if row.get("is_option"):
+        raw = str(row.get("Ticker", "")).strip()
+    else:
+        sec = row.get("Security Ticker")
+        raw = (str(sec).strip()
+               if pd.notna(sec) and str(sec).strip()
+               else str(row.get("Ticker", "")).strip())
+    parts = raw.split()
+    return parts[0].upper() if parts else ""
+
+
+def _apply_ticker_redirects(df: pd.DataFrame) -> pd.DataFrame:
+    """Merge source rows' Basket Allocation into target rows and drop
+    the sources.
+
+    Processes ``OPTION_TICKER_REDIRECTS`` (option rows only) and
+    ``STOCK_TICKER_REDIRECTS`` (stock rows only).  When multiple
+    target rows match, the redirected allocation is distributed
+    proportionally to their existing allocations.
+    """
+    if not OPTION_TICKER_REDIRECTS and not STOCK_TICKER_REDIRECTS:
+        return df
+
+    prefixes = df.apply(_ticker_prefix, axis=1)
+    rows_to_drop: set[int] = set()
+
+    for redirects, is_opt in [
+        (OPTION_TICKER_REDIRECTS, True),
+        (STOCK_TICKER_REDIRECTS, False),
+    ]:
+        for source, target in redirects.items():
+            src_upper = source.strip().upper()
+            tgt_upper = target.strip().upper()
+
+            type_mask = df["is_option"] == is_opt
+            source_mask = type_mask & (prefixes == src_upper)
+            target_mask = type_mask & (prefixes == tgt_upper)
+
+            source_idx = df.index[source_mask].tolist()
+            target_idx = df.index[target_mask].tolist()
+
+            if not source_idx:
+                continue
+            if not target_idx:
+                kind = "option" if is_opt else "stock"
+                print(f"  [!] Redirect {source} → {target} ({kind}): "
+                      f"no target rows found, skipping")
+                continue
+
+            total_alloc = df.loc[source_idx, "Basket Allocation"].sum()
+
+            target_allocs = df.loc[target_idx, "Basket Allocation"]
+            target_total = target_allocs.sum()
+            if target_total != 0:
+                for idx in target_idx:
+                    share = df.loc[idx, "Basket Allocation"] / target_total
+                    df.loc[idx, "Basket Allocation"] += total_alloc * share
+            else:
+                per_target = total_alloc / len(target_idx)
+                for idx in target_idx:
+                    df.loc[idx, "Basket Allocation"] += per_target
+
+            rows_to_drop.update(source_idx)
+            kind = "option" if is_opt else "stock"
+            print(f"  Redirect {source} → {target} ({kind}): "
+                  f"{total_alloc:+.4f}% from {len(source_idx)} row(s) "
+                  f"→ {len(target_idx)} row(s)")
+
+    if rows_to_drop:
+        df = df.drop(list(rows_to_drop)).reset_index(drop=True)
+
+    return df
+
+
 def load_portfolio(xlsx_path: str | None = None) -> pd.DataFrame:
     """Load, filter, and annotate the portfolio table.
 
@@ -114,6 +197,9 @@ def load_portfolio(xlsx_path: str | None = None) -> pd.DataFrame:
     # Derived columns.
     df["is_option"] = df.apply(_is_option, axis=1)
     df["clean_ticker"] = df.apply(_clean_ticker, axis=1)
+
+    # Apply ticker redirections (merge allocations, drop source rows).
+    df = _apply_ticker_redirects(df)
 
     df.reset_index(drop=True, inplace=True)
     print(f"Loaded {len(df)} positions ({df['is_option'].sum()} options).")

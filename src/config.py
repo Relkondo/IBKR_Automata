@@ -32,6 +32,24 @@ FILL_PATIENCE = 80
 STALE_ORDER_TOL_PCT = 0.005           # 0.5 %
 STALE_ORDER_TOL_PCT_ILLIQUID = 0.05   # 5 %
 
+# --- Ticker redirections ---
+# Merge a source ticker's Basket Allocation into a target ticker and
+# drop the source row.  Useful when the source instrument is too
+# expensive to trade (e.g. lot-size rules on index options) and a
+# similar, cheaper instrument can absorb its allocation.
+#
+# Keys / values are the ticker PREFIX (the part before the first
+# space in the input file).  For options the Ticker column is used;
+# for stocks the Security Ticker column (falling back to Ticker).
+#
+# Example:  {"SPXW": "QQQ"}  redirects all SPXW option rows'
+#           allocation to any QQQ option rows already in the file.
+OPTION_TICKER_REDIRECTS: dict[str, str] = {
+        "SPXW": "QQQ"
+}
+STOCK_TICKER_REDIRECTS: dict[str, str] = {
+}
+
 # --- Project Portfolio CSV column order ---
 # Columns listed here appear first (in this order) when saving.
 # Any extra columns present in the DataFrame are appended at the end.
