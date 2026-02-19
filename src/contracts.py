@@ -142,19 +142,24 @@ def _query_on_exchanges(ib: IB, symbol: str, mic: str | None) -> list:
     return _get_listings(ib, symbol)  # SMART fallback
 
 
-def _query_on_redirects(
+def _query_all_redirects(
     ib: IB, symbol: str, redirects: list[str],
-) -> tuple | None:
-    """Try each redirect exchange for *symbol* in priority order.
+) -> list[tuple]:
+    """Try **all** redirect exchanges for *symbol*.
 
-    Returns ``(ContractDetails, effective_mic)`` or ``None``.
+    Continues through every redirect MIC so that all available
+    listings are discovered.
+
+    Returns a list of ``(ContractDetails, effective_mic)`` tuples.
     """
+    hits: list[tuple] = []
     for redirect_mic in redirects:
         for exchange in _MIC_TO_IBKR.get(redirect_mic, []):
             details = _get_listings(ib, symbol, exchange)
             if details:
-                return details[0], redirect_mic
-    return None
+                hits.append((details[0], redirect_mic))
+                break
+    return hits
 
 
 # ==================================================================
@@ -163,6 +168,7 @@ def _query_on_redirects(
 
 def _resolve_stock(
     ib: IB, symbol: str, mic: str | None, name: str | None,
+    positions: dict[int, float] | None = None,
 ) -> tuple[int, str | None, str | None, str | None, str, str] | None:
     """Resolve a stock to ``(conid, long_name, api_symbol, effective_mic,
     currency, market_rule_ids)``.
@@ -173,14 +179,17 @@ def _resolve_stock(
       2. If none, search by name. Pick first result on expected exchange.
 
     Redirected exchanges (JP / HK → FWB2 / PINK):
-      1. Search by name (ignore ticker).
-      2. Pick first candidate with exact name match on a redirect exchange.
-      3. Otherwise, first candidate on any redirect exchange.
+      1. Search by name across all redirect exchanges.
+      2. Among conids where the user already holds a position, prefer
+         the one with the highest exposure (most shares held).
+      3. Otherwise, prefer exact name match, then first hit in the
+         default redirect order (XFRA > OTCM).
     """
     redirects = _REDIRECT_MICS.get(mic, []) if mic else []
 
     if redirects:
-        return _resolve_redirected(ib, symbol, mic, name, redirects)
+        return _resolve_redirected(
+            ib, symbol, mic, name, redirects, positions or {})
     else:
         return _resolve_direct(ib, symbol, mic, name)
 
@@ -224,10 +233,14 @@ def _resolve_direct(
 def _resolve_redirected(
     ib: IB, symbol: str, mic: str | None, name: str | None,
     redirects: list[str],
+    positions: dict[int, float],
 ) -> tuple[int, str | None, str | None, str | None, str, str] | None:
-    """Redirected: search by name, prefer exact name match on redirect exchange.
+    """Redirected: search all redirect exchanges, prefer the one the
+    user already has the most exposure on.
 
-    Falls back to the original exchange if no redirect listing is found.
+    Priority: existing position (largest ``abs(qty)``) → exact name
+    match → first hit (default ``_REDIRECT_MICS`` order) → original
+    exchange fallback.
     """
     if not name:
         print(f"    [!] No name for redirected exchange — cannot resolve")
@@ -239,34 +252,55 @@ def _resolve_redirected(
         return None
 
     name_upper = name.strip().upper()
-    fallback: tuple | None = None
+
+    # Collect ALL hits across all candidates and all redirect exchanges.
+    # Each entry: (ContractDetails, effective_mic, is_name_match)
+    all_hits: list[tuple] = []
+    seen_conids: set[int] = set()
 
     for desc in candidates:
-        hit = _query_on_redirects(ib, desc.contract.symbol, redirects)
-        if not hit:
-            continue
-
-        cd, eff_mic = hit
         desc_name = (desc.contract.description or "").strip().upper()
+        is_name_match = desc_name == name_upper
 
-        if desc_name == name_upper:
-            # Best case: exact name match on a redirect exchange.
-            print(f"    [>] Name match → "
-                  f"'{desc.contract.symbol}' on {eff_mic}")
-            return _result_from(cd, eff_mic)
+        hits = _query_all_redirects(ib, desc.contract.symbol, redirects)
+        for cd, eff_mic in hits:
+            cid = cd.contract.conId
+            if cid not in seen_conids:
+                seen_conids.add(cid)
+                all_hits.append((cd, eff_mic, is_name_match))
 
-        if fallback is None:
-            fallback = (cd, eff_mic)
+    if not all_hits:
+        print(f"    [~] No redirect listing; falling back to original "
+              f"exchange")
+        return _resolve_direct(ib, symbol, mic, name)
 
-    # No exact name match — use first candidate on a redirect exchange.
-    if fallback:
-        cd, eff_mic = fallback
-        print(f"    [>] Exchange match → '{cd.contract.symbol}' on {eff_mic}")
+    # --- Pick the best hit ---
+
+    # Priority 1: the conid where the user holds the largest position.
+    held = [
+        h for h in all_hits
+        if abs(positions.get(h[0].contract.conId, 0)) > 0
+    ]
+    if held:
+        best = max(held,
+                   key=lambda h: abs(positions.get(h[0].contract.conId, 0)))
+        cd, eff_mic, _ = best
+        qty = int(positions[cd.contract.conId])
+        print(f"    [>] Preferring {eff_mic} (conid {cd.contract.conId})"
+              f" — existing position of {qty} shares")
         return _result_from(cd, eff_mic)
 
-    # No redirect listing found — fall back to the original exchange.
-    print(f"    [~] No redirect listing; falling back to original exchange")
-    return _resolve_direct(ib, symbol, mic, name)
+    # Priority 2: exact name match (current default behaviour).
+    for cd, eff_mic, is_match in all_hits:
+        if is_match:
+            print(f"    [>] Name match → "
+                  f"'{cd.contract.symbol}' on {eff_mic}")
+            return _result_from(cd, eff_mic)
+
+    # Priority 3: first hit (respects _REDIRECT_MICS order).
+    cd, eff_mic, _ = all_hits[0]
+    print(f"    [>] Exchange match → '{cd.contract.symbol}' on {eff_mic}")
+    return _result_from(cd, eff_mic)
 
 
 # ==================================================================
@@ -344,7 +378,19 @@ def resolve_conids(ib: IB, df: pd.DataFrame) -> pd.DataFrame:
 
     Overwrites ``MIC Primary Exchange`` with the effective exchange
     (which may differ from the input when JP/HK redirects apply).
+
+    For redirected exchanges (JP / HK), existing IBKR positions are
+    checked so the resolver prefers the redirect exchange where the
+    user already holds the most shares.
     """
+    # Pre-fetch IBKR positions so redirected-exchange resolution can
+    # prefer the exchange where the user already has the most exposure.
+    positions: dict[int, float] = {}
+    for pos in ib.positions():
+        cid = pos.contract.conId
+        if cid:
+            positions[cid] = float(pos.position)
+
     conids: list[int | None] = []
     api_names: list[str | None] = []
     api_tickers: list[str | None] = []
@@ -367,7 +413,7 @@ def resolve_conids(ib: IB, df: pd.DataFrame) -> pd.DataFrame:
             result = _resolve_option(ib, raw, mic, name)
         else:
             print(f"  {label} Stock   '{symbol}' …")
-            result = _resolve_stock(ib, symbol, mic, name)
+            result = _resolve_stock(ib, symbol, mic, name, positions)
 
         if result:
             cid, r_name, r_sym, eff, ccy, mrids = result
