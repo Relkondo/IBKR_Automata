@@ -356,6 +356,9 @@ def _place_single_order(
                         "quantity": p.quantity,
                         "limit_price": p.limit_price,
                         "order_id": order_id,
+                        "usd_amount": _compute_usd_amount(
+                            p.limit_price, p.quantity,
+                            p.multiplier, p.fx),
                     })
             except Exception as exc:
                 print(f"    [!] Order failed: {exc}")
@@ -558,21 +561,27 @@ def print_order_summary(orders: list[dict]) -> None:
         print("\nNo orders were placed.")
         return
 
-    print("\n" + "=" * 78)
+    width = 92
+    print("\n" + "=" * width)
     print("  ORDER SUMMARY")
-    print("=" * 78)
+    print("=" * width)
     header = (
-        f"{'Ticker':<12} {'Name':<28} {'Side':<6} {'Qty':>8} "
-        f"{'Limit':>10} {'Order ID':>12}"
+        f"{'Ticker':<12} {'Name':<26} {'Side':<6} {'Qty':>8} "
+        f"{'Limit':>10} {'Amount':>14} {'Order ID':>12}"
     )
     print(header)
-    print("-" * 78)
+    print("-" * width)
+    total_usd = 0.0
     for o in orders:
+        usd = o.get("usd_amount", 0.0)
+        total_usd += usd
         print(
-            f"{o['ticker']:<12} {o['name'][:26]:<28} {o['side']:<6} "
+            f"{o['ticker']:<12} {o['name'][:24]:<26} {o['side']:<6} "
             f"{o['quantity']:>8} "
             f"{_format_currency(o['limit_price']):>10} "
+            f"{_format_currency(usd):>14} "
             f"{str(o['order_id']):>12}"
         )
-    print("=" * 78)
-    print(f"  Total orders placed: {len(orders)}\n")
+    print("=" * width)
+    print(f"  Total orders placed: {len(orders)}    "
+          f"Total amount: {_format_currency(total_usd)}\n")
