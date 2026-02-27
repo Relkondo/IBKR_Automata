@@ -148,12 +148,26 @@ def _format_currency(value: float, ccy: str = "USD") -> str:
 
 
 def _place_order(ib: IB, contract: Contract, order: Order,
-                 ) -> Trade:
-    """Place an order and wait briefly for acknowledgement."""
+                 ) -> tuple[Trade, str]:
+    """Place an order and wait briefly for acknowledgement.
+
+    Returns ``(trade, error_reason)`` where *error_reason* is the
+    error message captured from ib_async's errorEvent (empty string
+    if no error).  This is needed because ib_async may skip adding
+    the error to ``trade.log`` when the order is already "done"
+    (e.g. status Inactive arrives before the error callback).
+    """
+    captured: list[str] = []
+
+    def _on_error(reqId, errorCode, errorString, contract):
+        captured.append(f"Error {errorCode}: {errorString}")
+
+    ib.errorEvent += _on_error
     trade = ib.placeOrder(contract, order)
-    # Wait for TWS to acknowledge (status transitions).
     ib.sleep(1)
-    return trade
+    ib.errorEvent -= _on_error
+
+    return trade, captured[-1] if captured else ""
 
 
 # ==================================================================
@@ -264,6 +278,23 @@ def _handle_tick_error(
     return None
 
 
+def _order_summary(p: _OrderParams, **extra) -> dict:
+    """Build a compact summary dict for an order."""
+    d = {
+        "ticker": p.ticker,
+        "name": p.name,
+        "conid": p.conid,
+        "side": p.side,
+        "quantity": p.quantity,
+        "limit_price": p.limit_price,
+        "exchange": p.mic_str or "?",
+        "usd_amount": _compute_usd_amount(
+            p.limit_price, p.quantity, p.multiplier, p.fx),
+    }
+    d.update(extra)
+    return d
+
+
 def _place_single_order(
     ib: IB,
     p: _OrderParams,
@@ -272,6 +303,8 @@ def _place_single_order(
     *,
     allow_auto: bool = True,
     deferred_orders: list[_OrderParams] | None = None,
+    rejected_orders: list[dict] | None = None,
+    large_orders: list[dict] | None = None,
 ) -> str:
     """Run the prompt-loop for one order.
 
@@ -300,6 +333,9 @@ def _place_single_order(
                     f"{_format_currency(MAXIMUM_AMOUNT_AUTOMATIC_ORDER)}"
                     f" auto-confirm threshold)")
                 deferred_orders.append(p)
+                if large_orders is not None:
+                    large_orders.append(
+                        _order_summary(p, status="deferred"))
                 return "next"
             choice = "Y"
             print("  (auto-confirmed)")
@@ -329,7 +365,8 @@ def _place_single_order(
             )
 
             try:
-                trade = _place_order(ib, p.order_contract, order)
+                trade, error_reason = _place_order(
+                    ib, p.order_contract, order)
                 status = trade.orderStatus.status
 
                 # Check for Error 110 (tick-size rejection).
@@ -354,9 +391,23 @@ def _place_single_order(
                 order_id = trade.order.orderId
                 print(f"    Order placed -- order_id: {order_id} "
                       f"(status: {status})")
-                if status == "Cancelled":
-                    print(f"    [!] Order {order_id} was immediately "
-                          f"cancelled — not counting as placed.")
+                usd_amt = _compute_usd_amount(
+                    p.limit_price, p.quantity, p.multiplier, p.fx)
+                _FAILED_STATUSES = {
+                    "Cancelled", "Inactive", "ApiCancelled",
+                }
+                if status in _FAILED_STATUSES:
+                    print(f"    [!] Order {order_id} was {status.lower()}"
+                          f" — not counting as placed.")
+                    if rejected_orders is not None:
+                        reason = error_reason
+                        if not reason:
+                            for entry in trade.log:
+                                msg = getattr(entry, "message", "")
+                                if msg:
+                                    reason = msg
+                        rejected_orders.append(
+                            _order_summary(p, reason=reason))
                 else:
                     placed_orders.append({
                         "ticker": p.ticker,
@@ -366,12 +417,18 @@ def _place_single_order(
                         "quantity": p.quantity,
                         "limit_price": p.limit_price,
                         "order_id": order_id,
-                        "usd_amount": _compute_usd_amount(
-                            p.limit_price, p.quantity,
-                            p.multiplier, p.fx),
+                        "usd_amount": usd_amt,
                     })
+                    if (large_orders is not None
+                            and usd_amt > MAXIMUM_AMOUNT_AUTOMATIC_ORDER):
+                        large_orders.append(
+                            _order_summary(p, status="placed",
+                                           order_id=order_id))
             except Exception as exc:
                 print(f"    [!] Order failed: {exc}")
+                if rejected_orders is not None:
+                    rejected_orders.append(
+                        _order_summary(p, reason=str(exc)))
                 if is_auto:
                     print("    Skipping (auto-confirm mode).")
                 else:
@@ -527,11 +584,15 @@ def run_order_loop(ib: IB, df: pd.DataFrame) -> list[dict]:
     """Iterate over the portfolio and interactively place orders.
 
     Returns a list of summary records for successfully placed orders.
+    After all orders, sends a Telegram notification with
+    rejected/cancelled and large orders.
     """
     ensure_connected(ib)
 
     placed_orders: list[dict] = []
     deferred_orders: list[_OrderParams] = []
+    rejected_orders: list[dict] = []
+    large_orders: list[dict] = []
     state = _AutoState()
     total = len(df)
 
@@ -542,9 +603,11 @@ def run_order_loop(ib: IB, df: pd.DataFrame) -> list[dict]:
         signal = _place_single_order(
             ib, params, placed_orders, state,
             deferred_orders=deferred_orders,
+            rejected_orders=rejected_orders,
+            large_orders=large_orders,
         )
         if signal == "quit":
-            return placed_orders
+            break
 
     # Process deferred large orders (explicit manual approval required).
     if deferred_orders:
@@ -559,9 +622,15 @@ def run_order_loop(ib: IB, df: pd.DataFrame) -> list[dict]:
             signal = _place_single_order(
                 ib, params, placed_orders, _AutoState(),
                 allow_auto=False,
+                rejected_orders=rejected_orders,
+                large_orders=large_orders,
             )
             if signal == "quit":
                 break
+
+    # Send Telegram notification for flagged orders.
+    from src.telegram import notify_flagged_orders
+    notify_flagged_orders(rejected_orders, large_orders)
 
     return placed_orders
 

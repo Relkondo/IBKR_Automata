@@ -2,6 +2,10 @@
 
 import os
 
+from dotenv import load_dotenv
+
+load_dotenv()
+
 # --- TWS connection ---
 TWS_HOST = "127.0.0.1"
 TWS_PORT = 7497
@@ -115,3 +119,7 @@ PROJECT_PORTFOLIO_COLUMNS = [
     "Qty",
     "Actual Dollar Allocation",
 ]
+
+# --- Telegram notifications ---
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
