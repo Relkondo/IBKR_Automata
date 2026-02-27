@@ -26,10 +26,12 @@ MAXIMUM_AMOUNT_AUTOMATIC_ORDER = 1500  # USD – auto-confirmed orders above thi
 SELL_REBALANCE_RATIO_LIMIT = 1.5
 
 # --- Relative-order tuning ---
-# PRICE_OFFSET is the percentage offset passed directly to IBKR's
-# ``percentOffset`` field on a Relative (REL) order.  IBKR pegs the
-# order to the NBB (buy) or NBO (sell) and adds/subtracts this
-# percentage, handling tick-size rounding automatically.
+# PRICE_OFFSET is the percentage offset for Relative (REL) orders.
+# IBKR pegs the order to the NBB (buy) or NBO (sell) and
+# adds/subtracts this percentage, handling tick-size rounding
+# automatically.  Stored as a human-readable percentage; divided
+# by 100 before passing to IBKR's ``percentOffset`` field (which
+# expects a fraction: 0.10 = 10%).
 #   0   = no offset (passive, pegs exactly to bid/ask)
 #   50  = moderate offset (half the spread-equivalent)
 #   100 = very aggressive offset
@@ -79,6 +81,9 @@ IGNORE_NAMES: list[str] = [
     "ENPLAS CORP",
     "ASUSTEK COMPUTER INC",
     "TOHO TITANIUM CO LTD",
+    "SUMITOMO BAKELITE CO LTD",
+    "APERAM - DIVIDEND RIGHTS",
+    "TIC SOLUTIONS INC (OPTION)"
 ]
 
 # --- Project Portfolio CSV column order ---

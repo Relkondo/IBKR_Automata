@@ -324,7 +324,7 @@ def _place_single_order(
                 action=p.side,
                 totalQuantity=p.quantity,
                 lmtPrice=p.limit_price,
-                percentOffset=PRICE_OFFSET,
+                percentOffset=PRICE_OFFSET / 100,
                 tif='DAY',
             )
 

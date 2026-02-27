@@ -29,6 +29,33 @@ _REQUIRED_COLUMNS = [
 ]
 
 
+_OPT_SUFFIX = " (OPTION)"
+
+
+def _parse_ignore_sets() -> tuple[set[str], set[str]]:
+    """Split ``IGNORE_NAMES`` into (ignore_all, ignore_option_only) sets.
+
+    Entries ending with ``" (OPTION)"`` are option-only; the suffix is
+    stripped before storing.  All comparisons are upper-case.
+    """
+    ignore_all: set[str] = set()
+    ignore_opt: set[str] = set()
+    for entry in IGNORE_NAMES:
+        upper = entry.upper()
+        if upper.endswith(_OPT_SUFFIX):
+            ignore_opt.add(upper.removesuffix(_OPT_SUFFIX))
+        else:
+            ignore_all.add(upper)
+    return ignore_all, ignore_opt
+
+
+def is_name_ignored(name: str, is_option: bool) -> bool:
+    """Return ``True`` if *name* should be ignored per ``IGNORE_NAMES``."""
+    ignore_all, ignore_opt = _parse_ignore_sets()
+    upper = str(name).strip().upper()
+    return upper in ignore_all or (is_option and upper in ignore_opt)
+
+
 def _latest_xlsx(directory: str) -> str:
     """Return the path to the most recently modified .xlsx in *directory*."""
     xlsx_files = [
@@ -203,9 +230,9 @@ def load_portfolio(xlsx_path: str | None = None) -> pd.DataFrame:
     df = _apply_ticker_redirects(df)
 
     # Filter out ignored names.
-    ignored_names = {n.upper() for n in IGNORE_NAMES}
-    if ignored_names:
-        mask = df["Name"].str.upper().isin(ignored_names)
+    if IGNORE_NAMES:
+        mask = df.apply(
+            lambda r: is_name_ignored(r["Name"], r["is_option"]), axis=1)
         n_dropped = mask.sum()
         if n_dropped:
             dropped = df.loc[mask, "Name"].tolist()
