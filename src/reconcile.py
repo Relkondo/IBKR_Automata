@@ -19,7 +19,11 @@ from src.cancel import (
     CancelState, signed_order_qty,
     resolve_cancel_decision, execute_cancel,
 )
-from src.config import STALE_ORDER_TOL_PCT, STALE_ORDER_TOL_PCT_ILLIQUID
+from src.config import (
+    IGNORE_POSITION_TICKERS,
+    STALE_ORDER_TOL_PCT,
+    STALE_ORDER_TOL_PCT_ILLIQUID,
+)
 from src.connection import ensure_connected
 from src.exchange_hours import is_exchange_open
 from src.extra_positions import compute_net_quantity, reconcile_extra_positions
@@ -41,20 +45,25 @@ def _fetch_positions(ib: IB,
     meta : dict[int, dict]
         ``{conid: {ticker, name, currency, exchange}}``.
     """
+    ignored = {t.upper() for t in IGNORE_POSITION_TICKERS}
     raw = ib.positions()
     positions: dict[int, float] = {}
     meta: dict[int, dict] = {}
     for pos in raw:
         c = pos.contract
         cid = c.conId
-        if cid:
-            positions[cid] = float(pos.position)
-            meta[cid] = {
-                "ticker": c.symbol or str(cid),
-                "name": c.symbol or str(cid),
-                "currency": c.currency or "USD",
-                "exchange": c.primaryExchange or c.exchange or "",
-            }
+        if not cid:
+            continue
+        symbol = c.symbol or str(cid)
+        if symbol.upper() in ignored:
+            continue
+        positions[cid] = float(pos.position)
+        meta[cid] = {
+            "ticker": symbol,
+            "name": symbol,
+            "currency": c.currency or "USD",
+            "exchange": c.primaryExchange or c.exchange or "",
+        }
     return positions, meta
 
 
@@ -152,7 +161,9 @@ def compute_net_quantities(
         fx_val = get_fx(row)
 
         target = round(float(qty_raw))
-        net = compute_net_quantity(target, existing, pending, lp, fx_val)
+        mult = 100 if row.get("is_option") else 1
+        net = compute_net_quantity(target, existing, pending, lp, fx_val,
+                                   multiplier=mult)
         target_qtys.append(target)
         net_qtys.append(net)
 

@@ -4,17 +4,19 @@ Provides a hardcoded table of exchange opening hours (keyed by ISO MIC
 code) and utilities to check whether a given exchange is currently open,
 filter a DataFrame to only open-exchange rows, etc.
 
-Holidays are **not** handled — only regular weekday schedules are
-considered.  Intra-day lunch breaks (Tokyo, Hong Kong, Shanghai, etc.)
-are also ignored; the exchange is treated as open for the entire
-open-to-close window.
+Holidays are handled via the ``exchange_calendars`` library.  If a MIC
+can be mapped to a known calendar, the library's ``is_session()`` method
+is used to detect holidays.  Intra-day lunch breaks (Tokyo, Hong Kong,
+Shanghai, etc.) are still ignored; the exchange is treated as open for
+the entire open-to-close window.
 """
 
 from __future__ import annotations
 
-from datetime import datetime, time as dtime
+from datetime import date, datetime, time as dtime
 from zoneinfo import ZoneInfo
 
+import exchange_calendars as xcals
 import pandas as pd
 
 
@@ -89,6 +91,56 @@ EXCHANGE_HOURS: dict[str, tuple[str, str, str, tuple[int, ...]]] = {
 
 
 # ==================================================================
+# Holiday detection via exchange_calendars
+# ==================================================================
+# Most MICs map directly to exchange_calendars names (both use ISO
+# 10383).  This alias dict covers MICs that don't have their own
+# calendar but share holidays with another exchange.
+_XCAL_ALIAS: dict[str, str] = {
+    # US exchanges that follow NYSE holidays
+    "XNAS": "XNYS", "XNGS": "XNYS", "XNMS": "XNYS", "XNCM": "XNYS",
+    "ARCX": "XNYS", "BATS": "XNYS", "XASE": "XNYS", "IEXG": "XNYS",
+    "XPHL": "XNYS", "OTCM": "XNYS",
+    # Canada
+    "XTSX": "XTSE",
+    # Europe
+    "MTAA": "XMIL",
+    "XATH": "ASEX",
+    # Asia-Pacific
+    "ROCO": "XTAI",
+    "XSHE": "XSHG",
+    "XNSE": "XBOM",
+}
+
+_calendar_cache: dict[str, xcals.ExchangeCalendar | None] = {}
+
+
+def _get_calendar(mic: str) -> xcals.ExchangeCalendar | None:
+    """Return the exchange_calendars calendar for *mic*, or None."""
+    cal_name = _XCAL_ALIAS.get(mic, mic)
+    if cal_name in _calendar_cache:
+        return _calendar_cache[cal_name]
+    try:
+        cal = xcals.get_calendar(cal_name)
+    except xcals.errors.InvalidCalendarName:
+        cal = None
+    _calendar_cache[cal_name] = cal
+    return cal
+
+
+def _is_holiday(mic: str) -> bool:
+    """Return True if today is a holiday for *mic*'s exchange."""
+    cal = _get_calendar(mic)
+    if cal is None:
+        return False
+    today = date.today()
+    try:
+        return not cal.is_session(today)
+    except ValueError:
+        return False
+
+
+# ==================================================================
 # Session-level cache for unknown exchanges
 # ==================================================================
 _unknown_exchange_cache: dict[str, bool] = {}
@@ -106,19 +158,27 @@ def _parse_time(s: str) -> dtime:
 def is_exchange_open(mic: str) -> bool:
     """Return ``True`` if exchange *mic* is currently open.
 
-    For MIC codes not present in :data:`EXCHANGE_HOURS`, the user is
-    prompted interactively.  The response is cached for the remainder
-    of the session.
+    Checks three conditions in order:
+
+    1. **Holiday check** — if ``exchange_calendars`` has a calendar for
+       this MIC (directly or via alias) and today is *not* a session,
+       the exchange is closed.
+    2. **Weekday / hours check** — uses the hardcoded
+       :data:`EXCHANGE_HOURS` table.
+    3. **Unknown exchange** — prompts the user; cached for the session.
     """
     mic_upper = mic.upper().strip()
 
+    # 1. Holiday check (exchange_calendars).
+    if _is_holiday(mic_upper):
+        return False
+
+    # 2. Hours table check.
     entry = EXCHANGE_HOURS.get(mic_upper)
     if entry is None:
-        # Check session cache first.
         if mic_upper in _unknown_exchange_cache:
             return _unknown_exchange_cache[mic_upper]
 
-        # Ask the user.
         while True:
             choice = input(
                 f"Exchange '{mic_upper}' is not in the known hours table. "

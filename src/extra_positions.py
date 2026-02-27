@@ -34,6 +34,7 @@ def compute_net_quantity(
     pending: float,
     limit_price: float | None = None,
     fx_rate: float | None = None,
+    multiplier: int = 1,
 ) -> int:
     """Compute the net quantity to order and apply the min-trade filter.
 
@@ -49,6 +50,8 @@ def compute_net_quantity(
         Estimated limit price in the security's local currency.
     fx_rate : float | None
         ``local_currency / USD`` rate (1.0 for USD-denominated).
+    multiplier : int
+        Contract multiplier (100 for options, 1 for stocks).
 
     Returns
     -------
@@ -61,7 +64,7 @@ def compute_net_quantity(
         return 0
     if (limit_price is not None and limit_price > 0
             and fx_rate is not None and fx_rate > 0):
-        usd_value = abs(net) * limit_price / fx_rate
+        usd_value = abs(net) * limit_price * multiplier / fx_rate
         if usd_value < MINIMUM_TRADING_AMOUNT:
             return 0
     return net
@@ -328,6 +331,7 @@ def _build_extra_rows(
         row_dict["net_quantity"] = compute_net_quantity(
             target=0, existing=existing, pending=pending,
             limit_price=limit_price, fx_rate=ei.fx_rate,
+            multiplier=100 if ei.is_option else 1,
         )
 
         extra_rows.append(row_dict)

@@ -17,12 +17,24 @@ OUTPUT_DIR = os.path.join(PROJECT_ROOT, "output")
 MINIMUM_TRADING_AMOUNT = 100      # USD – net orders below this value are skipped
 MAXIMUM_AMOUNT_AUTOMATIC_ORDER = 10_000  # USD – auto-confirmed orders above this require explicit approval
 
-# --- Limit-price tuning ---
-# Controls how aggressively limit orders cross the bid/ask spread (0-100).
-#   0   = cross the spread fully (fills immediately)
-#   50  = midpoint (balanced)
-#   100 = sit on the passive side (cheapest, may not fill)
-FILL_PATIENCE = 120
+# --- Relative-order tuning ---
+# PRICE_OFFSET is the percentage offset passed directly to IBKR's
+# ``percentOffset`` field on a Relative (REL) order.  IBKR pegs the
+# order to the NBB (buy) or NBO (sell) and adds/subtracts this
+# percentage, handling tick-size rounding automatically.
+#   0   = no offset (passive, pegs exactly to bid/ask)
+#   50  = moderate offset (half the spread-equivalent)
+#   100 = very aggressive offset
+PRICE_OFFSET = 120
+
+# LIMIT_PRICE_OFFSET is a percentage of the reference price used to
+# compute the cap (buy) or floor (sell) limit price on the Relative
+# order.  This is NOT a spread percentage — it is applied to the full
+# bid/ask/last/close price.
+#   BUY  limit = bid  * (1 + LIMIT_PRICE_OFFSET / 100)
+#   SELL limit = ask  * (1 - LIMIT_PRICE_OFFSET / 100)
+#   Fallback chain: bid/ask → last → close
+LIMIT_PRICE_OFFSET = 2
 
 # --- Stale-order price tolerance ---
 # When reconciling, an existing order is considered "stale" (and eligible
@@ -49,6 +61,17 @@ OPTION_TICKER_REDIRECTS: dict[str, str] = {
 }
 STOCK_TICKER_REDIRECTS: dict[str, str] = {
 }
+
+# --- Ticker ignore lists ---
+# Tickers listed here (upper-case) are dropped from the input
+# spreadsheet and will not be bought or sold.
+IGNORE_INPUT_TICKERS: list[str] = []
+
+# Tickers listed here (upper-case) are completely invisible to the
+# system: they are excluded from IBKR positions (so they won't be
+# sold even if absent from the input), and they are also stripped
+# from the input spreadsheet if present.
+IGNORE_POSITION_TICKERS: list[str] = []
 
 # --- Project Portfolio CSV column order ---
 # Columns listed here appear first (in this order) when saving.

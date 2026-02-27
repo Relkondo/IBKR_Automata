@@ -5,11 +5,11 @@ Uses ``ib.reqTickers()`` for efficient batch snapshot requests and
 
 Fields used: bid, ask, last, close, high (day), low (day).
 
-Limit-price formula uses a FILL_PATIENCE parameter (0-100) that
-controls how aggressively we cross the bid/ask spread:
-  0   = cross the spread fully (fills immediately)
-  50  = midpoint (balanced)
-  100 = sit on the passive side (cheapest, may not fill)
+Limit-price formula uses ``LIMIT_PRICE_OFFSET`` to compute the cap
+(buy) or floor (sell) for Relative (REL) orders:
+  BUY  limit = bid  * (1 + LIMIT_PRICE_OFFSET / 100)
+  SELL limit = ask  * (1 - LIMIT_PRICE_OFFSET / 100)
+  Fallback chain: bid/ask → last → close
 """
 
 import json
@@ -20,7 +20,7 @@ import urllib.request
 import pandas as pd
 from ib_async import IB, Contract, Forex
 
-from src.config import FILL_PATIENCE, OUTPUT_DIR, PROJECT_PORTFOLIO_COLUMNS
+from src.config import LIMIT_PRICE_OFFSET, OUTPUT_DIR, PROJECT_PORTFOLIO_COLUMNS
 from src.connection import ensure_connected
 
 
@@ -242,23 +242,16 @@ def _snap_limit_price(row, ib: IB) -> float | None:
 # ==================================================================
 
 def calc_limit_price(row, *, is_sell: bool | None = None) -> float | None:
-    """Compute the limit price for a single row.
+    """Compute the cap/floor limit price for a Relative (REL) order.
 
-    Uses a spread-based formula controlled by ``FILL_PATIENCE`` (0-100):
+    Uses ``LIMIT_PRICE_OFFSET`` (a percentage of the reference price):
 
-    BUY  (Dollar Allocation >= 0):
-      limit = ask - (ask - bid) * FILL_PATIENCE / 100
-        0   → buy at ask  (aggressive, fills fast)
-        50  → buy at midpoint
-        100 → buy at bid  (patient, may not fill)
+    BUY  → limit = ref_price * (1 + LIMIT_PRICE_OFFSET / 100)
+    SELL → limit = ref_price * (1 - LIMIT_PRICE_OFFSET / 100)
 
-    SELL (Dollar Allocation < 0):
-      limit = bid + (ask - bid) * FILL_PATIENCE / 100
-        0   → sell at bid (aggressive, fills fast)
-        50  → sell at midpoint
-        100 → sell at ask (patient, may not fill)
-
-    Fallbacks when bid/ask unavailable: ``last``, then ``close``.
+    Reference price priority: bid (buy) / ask (sell), then last, then
+    close.  The result is the maximum willing-to-pay (buy) or minimum
+    willing-to-accept (sell).
 
     Parameters
     ----------
@@ -275,24 +268,24 @@ def calc_limit_price(row, *, is_sell: bool | None = None) -> float | None:
         dollar_alloc = row.get("Dollar Allocation")
         is_sell = pd.notna(dollar_alloc) and float(dollar_alloc) < 0
 
-    # Primary: spread-based formula when both bid and ask exist.
-    if pd.notna(bid) and pd.notna(ask):
-        spread = float(ask) - float(bid)
-        if spread >= 0:
-            if is_sell:
-                return round(float(bid) + spread * FILL_PATIENCE / 100, 2)
-            else:
-                return round(float(ask) - spread * FILL_PATIENCE / 100, 2)
+    multiplier = (1 - LIMIT_PRICE_OFFSET / 100) if is_sell \
+        else (1 + LIMIT_PRICE_OFFSET / 100)
+
+    # Primary: use bid (buy) or ask (sell) as reference.
+    if is_sell and pd.notna(ask) and float(ask) > 0:
+        return round(float(ask) * multiplier, 2)
+    if not is_sell and pd.notna(bid) and float(bid) > 0:
+        return round(float(bid) * multiplier, 2)
 
     # Fallback 1: last traded price.
     if pd.notna(last) and float(last) > 0:
-        return round(float(last), 2)
+        return round(float(last) * multiplier, 2)
 
     # Fallback 2: close price.
     if pd.notna(close) and float(close) > 0:
-        return round(float(close), 2)
+        return round(float(close) * multiplier, 2)
 
-    # Fallback 3: any available price.
+    # Fallback 3: any available price (no offset applied).
     if pd.notna(bid) and float(bid) > 0:
         return round(float(bid), 2)
     if pd.notna(ask) and float(ask) > 0:

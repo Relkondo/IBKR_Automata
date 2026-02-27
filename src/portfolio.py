@@ -15,7 +15,8 @@ import re
 import pandas as pd
 
 from src.config import (
-    ASSETS_DIR, OPTION_TICKER_REDIRECTS, STOCK_TICKER_REDIRECTS,
+    ASSETS_DIR, IGNORE_INPUT_TICKERS, IGNORE_POSITION_TICKERS,
+    OPTION_TICKER_REDIRECTS, STOCK_TICKER_REDIRECTS,
 )
 
 # Columns we need from the Excel file (header row names).
@@ -200,6 +201,20 @@ def load_portfolio(xlsx_path: str | None = None) -> pd.DataFrame:
 
     # Apply ticker redirections (merge allocations, drop source rows).
     df = _apply_ticker_redirects(df)
+
+    # Filter out ignored tickers.
+    # IGNORE_POSITION_TICKERS are also removed from the input (they are
+    # invisible to the system even when present in the spreadsheet).
+    all_ignored = {t.upper() for t in IGNORE_INPUT_TICKERS} | \
+        {t.upper() for t in IGNORE_POSITION_TICKERS}
+    if all_ignored:
+        mask = df["clean_ticker"].str.upper().isin(all_ignored)
+        n_dropped = mask.sum()
+        if n_dropped:
+            dropped_names = df.loc[mask, "clean_ticker"].tolist()
+            print(f"  Ignoring {n_dropped} ticker(s) from input: "
+                  f"{', '.join(dropped_names)}")
+            df = df[~mask]
 
     df.reset_index(drop=True, inplace=True)
     print(f"Loaded {len(df)} positions ({df['is_option'].sum()} options).")

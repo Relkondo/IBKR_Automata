@@ -11,12 +11,12 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 import pandas as pd
-from ib_async import IB, Contract, LimitOrder, Trade
+from ib_async import IB, Contract, Order, Trade
 
 from src.cancel import (
     CancelState, resolve_cancel_decision, execute_cancel,
 )
-from src.config import MAXIMUM_AMOUNT_AUTOMATIC_ORDER
+from src.config import MAXIMUM_AMOUNT_AUTOMATIC_ORDER, PRICE_OFFSET
 from src.connection import ensure_connected
 from src.contracts import exchange_to_mic
 from src.exchange_hours import is_exchange_open
@@ -146,7 +146,7 @@ def _format_currency(value: float, ccy: str = "USD") -> str:
     return f"{value:,.2f} {ccy}"
 
 
-def _place_order(ib: IB, contract: Contract, order: LimitOrder,
+def _place_order(ib: IB, contract: Contract, order: Order,
                  ) -> Trade:
     """Place an order and wait briefly for acknowledgement."""
     trade = ib.placeOrder(contract, order)
@@ -171,12 +171,14 @@ def _format_order_details(p: _OrderParams) -> str:
     local_amount = round(p.limit_price * p.quantity * p.multiplier, 2)
     lines = [
         f"\n{p.idx_label} {p.name} ({p.ticker})",
+        f"  Order Type        : REL (Relative)",
         f"  Side              : {p.side}",
         f"  Exchange          : {p.mic_str or '?'}",
         f"  Currency          : {p.ccy_label}",
-        f"  Limit Price       : {p.limit_price:,.2f} {p.ccy_label}",
+        f"  Limit Price (cap) : {p.limit_price:,.2f} {p.ccy_label}",
+        f"  Price Offset      : {PRICE_OFFSET}%",
         f"  Quantity          : {p.quantity}",
-        f"  Amount            : {local_amount:,.2f} {p.ccy_label}",
+        f"  Amount (at limit) : {local_amount:,.2f} {p.ccy_label}",
     ]
 
     if p.is_foreign and p.fx > 0:
@@ -315,8 +317,14 @@ def _place_single_order(
             elif choice == "E":
                 state.confirm_exchanges.add(p.mic_str)
 
-            order = LimitOrder(p.side, p.quantity, p.limit_price)
-            order.tif = "DAY"
+            order = Order(
+                orderType='REL',
+                action=p.side,
+                totalQuantity=p.quantity,
+                lmtPrice=p.limit_price,
+                percentOffset=PRICE_OFFSET,
+                tif='DAY',
+            )
 
             try:
                 trade = _place_order(ib, p.order_contract, order)

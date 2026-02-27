@@ -1,3 +1,4 @@
+exchange_calendars
 ib_async
 openpyxl
 pandas
