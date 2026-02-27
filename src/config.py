@@ -15,7 +15,7 @@ OUTPUT_DIR = os.path.join(PROJECT_ROOT, "output")
 
 # --- Trading thresholds ---
 MINIMUM_TRADING_AMOUNT = 100      # USD – net orders below this value are skipped
-MAXIMUM_AMOUNT_AUTOMATIC_ORDER = 10_000  # USD – auto-confirmed orders above this require explicit approval
+MAXIMUM_AMOUNT_AUTOMATIC_ORDER = 1500  # USD – auto-confirmed orders above this require explicit approval
 
 # --- Relative-order tuning ---
 # PRICE_OFFSET is the percentage offset passed directly to IBKR's
@@ -25,7 +25,7 @@ MAXIMUM_AMOUNT_AUTOMATIC_ORDER = 10_000  # USD – auto-confirmed orders above t
 #   0   = no offset (passive, pegs exactly to bid/ask)
 #   50  = moderate offset (half the spread-equivalent)
 #   100 = very aggressive offset
-PRICE_OFFSET = 120
+PRICE_OFFSET = 10
 
 # LIMIT_PRICE_OFFSET is a percentage of the reference price used to
 # compute the cap (buy) or floor (sell) limit price on the Relative
@@ -62,16 +62,12 @@ OPTION_TICKER_REDIRECTS: dict[str, str] = {
 STOCK_TICKER_REDIRECTS: dict[str, str] = {
 }
 
-# --- Ticker ignore lists ---
-# Tickers listed here (upper-case) are dropped from the input
-# spreadsheet and will not be bought or sold.
-IGNORE_INPUT_TICKERS: list[str] = []
-
+# --- Ticker ignore list ---
 # Tickers listed here (upper-case) are completely invisible to the
-# system: they are excluded from IBKR positions (so they won't be
-# sold even if absent from the input), and they are also stripped
-# from the input spreadsheet if present.
-IGNORE_POSITION_TICKERS: list[str] = []
+# system: they are filtered out of the input spreadsheet (won't be
+# bought) AND excluded from IBKR positions (won't be sold even if
+# absent from the input).
+IGNORE_TICKERS: list[str] = ["ENPLAS CORP", "ASUSTEK COMPUTER INC"]
 
 # --- Project Portfolio CSV column order ---
 # Columns listed here appear first (in this order) when saving.

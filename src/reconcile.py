@@ -20,7 +20,7 @@ from src.cancel import (
     resolve_cancel_decision, execute_cancel,
 )
 from src.config import (
-    IGNORE_POSITION_TICKERS,
+    IGNORE_TICKERS,
     STALE_ORDER_TOL_PCT,
     STALE_ORDER_TOL_PCT_ILLIQUID,
 )
@@ -45,7 +45,7 @@ def _fetch_positions(ib: IB,
     meta : dict[int, dict]
         ``{conid: {ticker, name, currency, exchange}}``.
     """
-    ignored = {t.upper() for t in IGNORE_POSITION_TICKERS}
+    ignored = {t.upper() for t in IGNORE_TICKERS}
     raw = ib.positions()
     positions: dict[int, float] = {}
     meta: dict[int, dict] = {}
