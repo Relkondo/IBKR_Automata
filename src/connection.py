@@ -3,11 +3,12 @@
 Provides a thin wrapper that establishes a connection to a running
 Trader Workstation instance and returns the ``IB`` handle used by
 all other modules.  Also provides a ``suppress_errors`` context
-manager for silencing specific IBKR error codes during cancellation.
+manager for silencing specific IBKR error codes.
 """
 
 from __future__ import annotations
 
+import logging
 from contextlib import contextmanager
 
 from ib_async import IB
@@ -15,18 +16,36 @@ from ib_async import IB
 from src.config import TWS_HOST, TWS_PORT, TWS_CLIENT_ID
 
 # ==================================================================
-# Error-code suppression (used during order cancellation etc.)
+# Error-code suppression
 # ==================================================================
 
 _suppressed_codes: set[int] = set()
+
+_IB_LOGGER = logging.getLogger("ib_async.wrapper")
+
+
+class _ErrorCodeFilter(logging.Filter):
+    """Drop log records whose message matches a suppressed error code."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if not _suppressed_codes:
+            return True
+        msg = record.getMessage()
+        return not any(
+            f"Error {code}," in msg or f"Warning {code}," in msg
+            for code in _suppressed_codes
+        )
+
+
+_error_filter = _ErrorCodeFilter()
 
 
 @contextmanager
 def suppress_errors(*codes: int):
     """Context manager that silences specific IBKR error codes.
 
-    Patches the ``Wrapper.error`` method on the connected IB instance
-    so the suppressed codes never reach the logger or error event.
+    Only suppresses the log output — the internal request lifecycle
+    (``_endReq``, trade updates, etc.) still proceeds normally.
 
     Usage::
 
@@ -72,21 +91,9 @@ def connect() -> IB:
     ib = IB()
     ib.connect(TWS_HOST, TWS_PORT, clientId=TWS_CLIENT_ID)
 
-    # Patch the wrapper's error method to support ``suppress_errors``.
-    _original_error = ib.wrapper.error
-
-    def _filtered_error(
-        reqId: int,
-        errorCode: int,
-        errorString: str,
-        advancedOrderRejectJson: str = "",
-    ) -> None:
-        if errorCode in _suppressed_codes:
-            return
-        _original_error(reqId, errorCode, errorString,
-                        advancedOrderRejectJson)
-
-    ib.wrapper.error = _filtered_error
+    # Attach the log filter so ``suppress_errors`` can mute specific
+    # error codes without interfering with the request lifecycle.
+    _IB_LOGGER.addFilter(_error_filter)
 
     # Type 3: live if subscribed, delayed otherwise.
     ib.reqMarketDataType(3)

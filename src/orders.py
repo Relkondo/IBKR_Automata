@@ -56,6 +56,7 @@ class _OrderParams:
     dollar_alloc: float
     net_qty_raw: float | None  # pandas scalar: set by reconciliation, NaN/None otherwise
     mic_str: str
+    is_option: bool
 
 
 # ==================================================================
@@ -170,7 +171,8 @@ def _format_order_details(p: _OrderParams) -> str:
     """Build the human-readable order summary shown before each prompt."""
     local_amount = round(p.limit_price * p.quantity * p.multiplier, 2)
     lines = [
-        f"\n{p.idx_label} {p.name} ({p.ticker})",
+        f"\n{p.idx_label} {p.name} ({p.ticker})"
+        + (" (OPTION)" if p.is_option else ""),
         f"  Order Type        : REL (Relative)",
         f"  Side              : {p.side}",
         f"  Exchange          : {p.mic_str or '?'}",
@@ -513,6 +515,7 @@ def _prepare_order_params(
         dollar_alloc=dollar_alloc,
         net_qty_raw=net_qty_raw,
         mic_str=mic_str,
+        is_option=is_option,
     )
 
 

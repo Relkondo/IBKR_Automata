@@ -17,6 +17,14 @@ OUTPUT_DIR = os.path.join(PROJECT_ROOT, "output")
 MINIMUM_TRADING_AMOUNT = 100      # USD – net orders below this value are skipped
 MAXIMUM_AMOUNT_AUTOMATIC_ORDER = 1500  # USD – auto-confirmed orders above this require explicit approval
 
+# When rebalancing an existing position, a high stock price can make
+# the actual order (rounded to whole shares) much larger than the
+# projected change from the portfolio model.  If the ratio
+# |actual_vs_current| / |project_vs_current| exceeds this limit,
+# the SELL order is skipped to avoid excessive trading and maintain
+# exposure.  Only applies to SELL orders with existing positions.
+SELL_REBALANCE_RATIO_LIMIT = 1.5
+
 # --- Relative-order tuning ---
 # PRICE_OFFSET is the percentage offset passed directly to IBKR's
 # ``percentOffset`` field on a Relative (REL) order.  IBKR pegs the
@@ -62,12 +70,16 @@ OPTION_TICKER_REDIRECTS: dict[str, str] = {
 STOCK_TICKER_REDIRECTS: dict[str, str] = {
 }
 
-# --- Ticker ignore list ---
-# Tickers listed here (upper-case) are completely invisible to the
-# system: they are filtered out of the input spreadsheet (won't be
-# bought) AND excluded from IBKR positions (won't be sold even if
-# absent from the input).
-IGNORE_TICKERS: list[str] = ["ENPLAS CORP", "ASUSTEK COMPUTER INC"]
+# --- Name ignore list ---
+# Securities whose name (case-insensitive) matches any entry here are
+# completely invisible to the system: they are filtered out of the
+# input spreadsheet (won't be bought) AND excluded from extra IBKR
+# positions (won't be sold even if absent from the input).
+IGNORE_NAMES: list[str] = [
+    "ENPLAS CORP",
+    "ASUSTEK COMPUTER INC",
+    "TOHO TITANIUM CO LTD",
+]
 
 # --- Project Portfolio CSV column order ---
 # Columns listed here appear first (in this order) when saving.

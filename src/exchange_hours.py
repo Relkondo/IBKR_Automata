@@ -141,12 +141,6 @@ def _is_holiday(mic: str) -> bool:
 
 
 # ==================================================================
-# Session-level cache for unknown exchanges
-# ==================================================================
-_unknown_exchange_cache: dict[str, bool] = {}
-
-
-# ==================================================================
 # Core helpers
 # ==================================================================
 
@@ -176,21 +170,9 @@ def is_exchange_open(mic: str) -> bool:
     # 2. Hours table check.
     entry = EXCHANGE_HOURS.get(mic_upper)
     if entry is None:
-        if mic_upper in _unknown_exchange_cache:
-            return _unknown_exchange_cache[mic_upper]
-
-        while True:
-            choice = input(
-                f"Exchange '{mic_upper}' is not in the known hours table. "
-                f"Consider it OPEN or CLOSED? [O/C] > "
-            ).strip().upper()
-            if choice in ("O", "OPEN"):
-                _unknown_exchange_cache[mic_upper] = True
-                return True
-            elif choice in ("C", "CLOSED"):
-                _unknown_exchange_cache[mic_upper] = False
-                return False
-            print("  Please enter O (open) or C (closed).")
+        print(f"  Exchange '{mic_upper}' not in known hours table — "
+              f"assuming open.")
+        return True
 
     tz_name, open_str, close_str, trading_days = entry
     tz = ZoneInfo(tz_name)

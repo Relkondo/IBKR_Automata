@@ -19,7 +19,7 @@ from src.cancel import (
     CancelState, signed_order_qty,
     resolve_cancel_decision, execute_cancel,
 )
-from src.config import MINIMUM_TRADING_AMOUNT
+from src.config import IGNORE_NAMES, MINIMUM_TRADING_AMOUNT
 from src.contracts import exchange_to_mic
 from src.exchange_hours import is_exchange_open
 from src.market_data import (
@@ -371,6 +371,21 @@ def reconcile_extra_positions(
 
     # 1. Qualify contracts and gather metadata.
     info = _fetch_extra_metadata(ib, extra_conids, position_meta)
+
+    # Filter out positions whose long name matches IGNORE_NAMES.
+    ignored_names = {n.upper() for n in IGNORE_NAMES}
+    if ignored_names:
+        ignored_cids = [
+            cid for cid in extra_conids
+            if info[cid].long_name.upper() in ignored_names
+        ]
+        if ignored_cids:
+            names = [info[cid].long_name for cid in ignored_cids]
+            print(f"  Ignoring {len(ignored_cids)} extra position(s): "
+                  f"{', '.join(names)}")
+            extra_conids = [c for c in extra_conids if c not in ignored_cids]
+            if not extra_conids:
+                return [], 0
 
     # 2. Fetch market-data snapshots.
     snapshot = _fetch_extra_snapshots(ib, extra_conids, info)

@@ -15,7 +15,7 @@ import re
 import pandas as pd
 
 from src.config import (
-    ASSETS_DIR, IGNORE_TICKERS,
+    ASSETS_DIR, IGNORE_NAMES,
     OPTION_TICKER_REDIRECTS, STOCK_TICKER_REDIRECTS,
 )
 
@@ -202,15 +202,15 @@ def load_portfolio(xlsx_path: str | None = None) -> pd.DataFrame:
     # Apply ticker redirections (merge allocations, drop source rows).
     df = _apply_ticker_redirects(df)
 
-    # Filter out ignored tickers.
-    all_ignored = {t.upper() for t in IGNORE_TICKERS}
-    if all_ignored:
-        mask = df["clean_ticker"].str.upper().isin(all_ignored)
+    # Filter out ignored names.
+    ignored_names = {n.upper() for n in IGNORE_NAMES}
+    if ignored_names:
+        mask = df["Name"].str.upper().isin(ignored_names)
         n_dropped = mask.sum()
         if n_dropped:
-            dropped_names = df.loc[mask, "clean_ticker"].tolist()
-            print(f"  Ignoring {n_dropped} ticker(s) from input: "
-                  f"{', '.join(dropped_names)}")
+            dropped = df.loc[mask, "Name"].tolist()
+            print(f"  Ignoring {n_dropped} position(s) from input: "
+                  f"{', '.join(dropped)}")
             df = df[~mask]
 
     df.reset_index(drop=True, inplace=True)

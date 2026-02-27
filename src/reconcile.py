@@ -20,7 +20,7 @@ from src.cancel import (
     resolve_cancel_decision, execute_cancel,
 )
 from src.config import (
-    IGNORE_TICKERS,
+    SELL_REBALANCE_RATIO_LIMIT,
     STALE_ORDER_TOL_PCT,
     STALE_ORDER_TOL_PCT_ILLIQUID,
 )
@@ -45,7 +45,6 @@ def _fetch_positions(ib: IB,
     meta : dict[int, dict]
         ``{conid: {ticker, name, currency, exchange}}``.
     """
-    ignored = {t.upper() for t in IGNORE_TICKERS}
     raw = ib.positions()
     positions: dict[int, float] = {}
     meta: dict[int, dict] = {}
@@ -55,8 +54,6 @@ def _fetch_positions(ib: IB,
         if not cid:
             continue
         symbol = c.symbol or str(cid)
-        if symbol.upper() in ignored:
-            continue
         positions[cid] = float(pos.position)
         meta[cid] = {
             "ticker": symbol,
@@ -164,6 +161,30 @@ def compute_net_quantities(
         mult = 100 if row.get("is_option") else 1
         net = compute_net_quantity(target, existing, pending, lp, fx_val,
                                    multiplier=mult)
+
+        # Sell-rebalance ratio guard: when reducing an existing position,
+        # verify the rounded order doesn't overshoot the projected change.
+        if net < 0 and existing != 0 and lp and fx_val:
+            actual_da_raw = row.get("Actual Dollar Allocation")
+            dollar_alloc_raw = row.get("Dollar Allocation")
+            if pd.notna(actual_da_raw) and pd.notna(dollar_alloc_raw):
+                current_value = abs(existing) * lp * mult / fx_val
+                project_vs_current = float(dollar_alloc_raw) - current_value
+                actual_vs_current = float(actual_da_raw) - current_value
+                if project_vs_current != 0:
+                    ratio = actual_vs_current / project_vs_current
+                    if ratio > SELL_REBALANCE_RATIO_LIMIT:
+                        name = row.get("Name", "")
+                        ticker = row.get("clean_ticker", "")
+                        print(
+                            f"  Zeroing SELL '{name}' ({ticker}) -- "
+                            f"rebalance ratio {ratio:.2f} exceeds "
+                            f"{SELL_REBALANCE_RATIO_LIMIT} "
+                            f"(actual ${actual_vs_current:+,.0f} vs "
+                            f"projected ${project_vs_current:+,.0f})."
+                        )
+                        net = 0
+
         target_qtys.append(target)
         net_qtys.append(net)
 

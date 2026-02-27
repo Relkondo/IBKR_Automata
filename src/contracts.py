@@ -14,6 +14,7 @@ import time
 import pandas as pd
 from ib_async import IB, Stock, Option
 
+from src.connection import suppress_errors
 from src.portfolio import OPT_TICKER_RE
 
 
@@ -432,10 +433,12 @@ def resolve_conids(ib: IB, df: pd.DataFrame) -> pd.DataFrame:
         if is_opt:
             raw = str(row.get("Ticker", "")).strip()
             print(f"  {label} Option  '{raw}' …")
-            result = _resolve_option(ib, raw, mic, name)
+            with suppress_errors(200):
+                result = _resolve_option(ib, raw, mic, name)
         else:
             print(f"  {label} Stock   '{symbol}' …")
-            result = _resolve_stock(ib, symbol, mic, name, positions)
+            with suppress_errors(200):
+                result = _resolve_stock(ib, symbol, mic, name, positions)
 
         if result:
             cid, r_name, r_sym, eff, ccy, mrids = result
