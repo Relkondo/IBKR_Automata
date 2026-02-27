@@ -404,6 +404,7 @@ def reconcile(ib: IB,
     print(f"  Stocks to BUY     : {stocks_to_buy}")
     print(f"  Stocks to SELL    : {stocks_to_sell}")
     print(f"  Already on target : {stocks_on_target}")
-    print(f"  Stale orders cancelled : {total_cancelled}\n")
+    print(f"  Stale orders cancelled : {total_cancelled}")
+    print(f"Note: all exchanges are included in the above reconciliation process.\n")
 
     return df

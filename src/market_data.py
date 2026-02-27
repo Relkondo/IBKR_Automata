@@ -21,7 +21,7 @@ import pandas as pd
 from ib_async import IB, Contract, Forex
 
 from src.config import LIMIT_PRICE_OFFSET, OUTPUT_DIR, PROJECT_PORTFOLIO_COLUMNS
-from src.connection import ensure_connected
+from src.connection import ensure_connected, suppress_errors
 
 
 # ==================================================================
@@ -68,7 +68,8 @@ def snapshot_batch(
     result: dict[int, dict] = {}
 
     try:
-        tickers = ib.reqTickers(*contracts)
+        with suppress_errors(354):
+            tickers = ib.reqTickers(*contracts)
     except Exception as exc:
         print(f"  [!] reqTickers failed: {exc}")
         return result
@@ -412,30 +413,31 @@ def resolve_fx_rate(ib: IB, ccy: str) -> float | None:
     Returns the rate (units of *ccy* per 1 USD) or None.
     """
     # --- Attempt 1: IBKR Forex snapshot ---
-    if ccy in _CCY_AS_BASE:
-        # Convention: {ccy}USD → price is "USD per 1 ccy", invert.
-        rate = _try_forex_snapshot(ib, f"{ccy}USD")
-        if rate is not None:
-            inverted = round(1.0 / rate, 6)
-            print(f"  USD -> {ccy} = {inverted}")
-            return inverted
-        # Fallback: try reverse.
-        rate = _try_forex_snapshot(ib, f"USD{ccy}")
-        if rate is not None:
-            print(f"  USD -> {ccy} = {rate}")
-            return rate
-    else:
-        # Convention: USD{ccy} → price is "ccy per 1 USD", direct.
-        rate = _try_forex_snapshot(ib, f"USD{ccy}")
-        if rate is not None:
-            print(f"  USD -> {ccy} = {rate}")
-            return rate
-        # Fallback: try reverse.
-        rate = _try_forex_snapshot(ib, f"{ccy}USD")
-        if rate is not None:
-            inverted = round(1.0 / rate, 6)
-            print(f"  USD -> {ccy} = {inverted}")
-            return inverted
+    with suppress_errors(200):
+        if ccy in _CCY_AS_BASE:
+            # Convention: {ccy}USD → price is "USD per 1 ccy", invert.
+            rate = _try_forex_snapshot(ib, f"{ccy}USD")
+            if rate is not None:
+                inverted = round(1.0 / rate, 6)
+                print(f"  USD -> {ccy} = {inverted}")
+                return inverted
+            # Fallback: try reverse.
+            rate = _try_forex_snapshot(ib, f"USD{ccy}")
+            if rate is not None:
+                print(f"  USD -> {ccy} = {rate}")
+                return rate
+        else:
+            # Convention: USD{ccy} → price is "ccy per 1 USD", direct.
+            rate = _try_forex_snapshot(ib, f"USD{ccy}")
+            if rate is not None:
+                print(f"  USD -> {ccy} = {rate}")
+                return rate
+            # Fallback: try reverse.
+            rate = _try_forex_snapshot(ib, f"{ccy}USD")
+            if rate is not None:
+                inverted = round(1.0 / rate, 6)
+                print(f"  USD -> {ccy} = {inverted}")
+                return inverted
 
     # --- Attempt 2: free web API ---
     web_rate = _fetch_web_fx_rate(ccy)
