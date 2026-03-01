@@ -58,31 +58,39 @@ def start_gateway(timeout: int = GATEWAY_STARTUP_TIMEOUT) -> subprocess.Popen:
             f"and set IBC_PATH (currently '{IBC_PATH}')."
         )
 
-    env = {
-        **os.environ,
-        "TWS_MAJOR_VRSN": TWS_MAJOR_VRSN,
-        "IBC_INI": IBC_INI,
-        "IBC_PATH": IBC_PATH,
-        "TWS_PATH": GATEWAY_TWS_PATH,
-        "TRADING_MODE": TRADING_MODE,
-        "TWOFA_TIMEOUT_ACTION": "exit",
-        "LOG_PATH": os.path.expanduser("~/ibc/logs"),
-        "APP": "GATEWAY",
-    }
+    cmd = [
+        script,
+        TWS_MAJOR_VRSN,
+        "--gateway",
+        f"--tws-path={GATEWAY_TWS_PATH}",
+        f"--ibc-path={IBC_PATH}",
+        f"--ibc-ini={IBC_INI}",
+        f"--mode={TRADING_MODE}",
+        "--on2fatimeout=exit",
+    ]
+
+    log_dir = os.path.expanduser("~/ibc/logs")
+    os.makedirs(log_dir, exist_ok=True)
+    log_file = os.path.join(log_dir, "ibc_stdout.log")
 
     print(f"Starting IB Gateway via IBC ({script}) ...")
-    proc = subprocess.Popen(
-        [script],
-        env=env,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
+    print(f"  cmd: {' '.join(cmd)}")
+    with open(log_file, "w") as fh:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=fh,
+            stderr=subprocess.STDOUT,
+        )
 
-    _wait_for_gateway(timeout)
+    _wait_for_gateway(timeout, proc, log_file)
     return proc
 
 
-def _wait_for_gateway(timeout: int) -> None:
+def _wait_for_gateway(
+    timeout: int,
+    proc: subprocess.Popen | None = None,
+    log_file: str | None = None,
+) -> None:
     """Poll the gateway port until it accepts connections or *timeout* expires."""
     poll_interval = 3
     elapsed = 0
@@ -90,6 +98,18 @@ def _wait_for_gateway(timeout: int) -> None:
         if is_gateway_running():
             print(f"IB Gateway is ready (took ~{elapsed}s).")
             return
+
+        if proc is not None and proc.poll() is not None:
+            tail = ""
+            if log_file and os.path.isfile(log_file):
+                with open(log_file) as fh:
+                    tail = fh.read()[-2000:]
+            raise RuntimeError(
+                f"IBC process exited with code {proc.returncode} "
+                f"before Gateway became ready.\n\n"
+                f"--- IBC output (last 2000 chars) ---\n{tail}"
+            )
+
         time.sleep(poll_interval)
         elapsed += poll_interval
         if elapsed % 15 == 0:

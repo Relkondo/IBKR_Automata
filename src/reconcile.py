@@ -215,6 +215,150 @@ def _is_order_stale(
     return abs(order_price - limit_price) / limit_price > tol_pct
 
 
+def _cancel_superfluous_orders(
+    ib: IB,
+    df: pd.DataFrame,
+    orders_by_conid: dict[int, list[dict]],
+    positions: dict[int, float],
+    all_exchanges: bool,
+    state: CancelState,
+) -> tuple[dict[int, list[dict]], list[int]]:
+    """Cancel orders whose direction or size conflicts with the target.
+
+    An order is *superfluous* when keeping it would force
+    ``compute_net_quantities`` to emit a counter-order.  Cases:
+
+    * Position already on target, yet a BUY or SELL is pending.
+    * A BUY is pending but the position needs to *decrease*
+      (or vice versa).
+    * Pending orders in the correct direction exceed the quantity
+      needed, causing a counter-order for the excess.
+
+    Returns
+    -------
+    remaining_orders : dict[int, list[dict]]
+        Orders grouped by conid, with superfluous ones removed.
+    cancelled_counts : list[int]
+        Per-row count of cancelled orders (aligned with *df*).
+    """
+    remaining: dict[int, list[dict]] = {
+        cid: list(ords) for cid, ords in orders_by_conid.items()
+    }
+    cancelled_counts: list[int] = []
+    total = len(df)
+
+    for idx, row in df.iterrows():
+        conid_raw = row.get("conid")
+        qty_raw = row.get("Qty")
+
+        if pd.isna(conid_raw) or pd.isna(qty_raw):
+            cancelled_counts.append(0)
+            continue
+
+        conid = int(conid_raw)
+        target = round(float(qty_raw))
+        existing = round(positions.get(conid, 0))
+        conid_orders = remaining.get(conid, [])
+
+        if not conid_orders:
+            cancelled_counts.append(0)
+            continue
+
+        raw_need = target - existing
+
+        to_cancel: list[dict] = []
+        to_keep: list[dict] = []
+
+        if raw_need == 0:
+            to_cancel = list(conid_orders)
+        else:
+            # Separate wrong-direction orders from right-direction ones.
+            right_dir: list[dict] = []
+            for order in conid_orders:
+                sq = signed_order_qty(order)
+                if (raw_need > 0 and sq < 0) or (raw_need < 0 and sq > 0):
+                    to_cancel.append(order)
+                else:
+                    right_dir.append(order)
+
+            # If right-direction orders overshoot the need, trim.
+            right_total = sum(abs(signed_order_qty(o)) for o in right_dir)
+            if right_total > abs(raw_need):
+                accumulated = 0.0
+                for order in right_dir:
+                    sq_abs = abs(signed_order_qty(order))
+                    if accumulated + sq_abs <= abs(raw_need):
+                        accumulated += sq_abs
+                        to_keep.append(order)
+                    else:
+                        to_cancel.append(order)
+            else:
+                to_keep.extend(right_dir)
+
+        if not to_cancel:
+            cancelled_counts.append(0)
+            continue
+
+        # Determine exchange and cancellability.
+        mic = row.get("MIC Primary Exchange")
+        mic_str = str(mic).strip().upper() if pd.notna(mic) else ""
+        can_cancel = all_exchanges or (
+            bool(mic_str) and is_exchange_open(mic_str)
+        )
+
+        name = row.get("Name", "")
+        label = f"[{idx + 1}/{total}]"
+        cancelled = 0
+
+        for order in to_cancel:
+            sq = signed_order_qty(order)
+            direction = "BUY" if sq > 0 else "SELL"
+
+            if raw_need == 0:
+                reason_detail = "position already on target"
+            elif (raw_need > 0 and sq < 0) or (raw_need < 0 and sq > 0):
+                reason_detail = "wrong direction"
+            else:
+                reason_detail = "exceeds quantity needed"
+
+            header = (
+                f"\n  {label} Superfluous {direction} order "
+                f"{order['orderId']} for '{name}' "
+                f"(qty={int(abs(sq))}, need={raw_need:+d}, "
+                f"{reason_detail})\n"
+                f"  Exchange: {mic_str or '?'}"
+            )
+
+            decision, is_auto = resolve_cancel_decision(
+                mic_str, can_cancel, state, prompt_header=header)
+
+            if decision == "skip":
+                reason = ("exchange closed" if not can_cancel
+                          else "auto-skip" if is_auto else "skipped")
+                print(f"  {label} Superfluous order {order['orderId']} "
+                      f"for '{name}' — {reason}")
+                to_keep.append(order)
+                continue
+
+            trade_obj = order.get("trade")
+            if trade_obj and execute_cancel(ib, trade_obj.order):
+                auto_tag = " (auto)" if is_auto else ""
+                print(f"  {label} Cancelled superfluous {direction} order "
+                      f"{order['orderId']} for '{name}' "
+                      f"(qty={int(abs(sq))}, need={raw_need:+d})"
+                      f"{auto_tag}")
+                cancelled += 1
+            else:
+                print(f"  [!] Failed to cancel order "
+                      f"{order['orderId']}")
+                to_keep.append(order)
+
+        remaining[conid] = to_keep
+        cancelled_counts.append(cancelled)
+
+    return remaining, cancelled_counts
+
+
 def _cancel_stale_orders(
     ib: IB,
     df: pd.DataFrame,
@@ -343,6 +487,13 @@ def reconcile(ib: IB,
     positions, position_meta = _fetch_positions(ib)
     print(f"  Found {len(positions)} positions.\n")
 
+    if not positions and auto_mode:
+        raise RuntimeError(
+            "IBKR returned 0 positions in auto mode.  This almost "
+            "certainly means the Gateway data sync has not completed.  "
+            "Aborting to prevent duplicate orders."
+        )
+
     print("Fetching open orders ...")
     open_orders = _fetch_open_orders(ib)
     print(f"  Found {len(open_orders)} active open orders.\n")
@@ -361,12 +512,20 @@ def reconcile(ib: IB,
         df["cancelled_orders"] = 0
         cancelled_counts: list[int] = [0] * len(df)
     else:
-        # Phase 1: Cancel stale orders.
-        remaining_orders, cancelled_counts = _cancel_stale_orders(
+        # Phase 1: Cancel stale orders (price drifted beyond tolerance).
+        remaining_orders, stale_counts = _cancel_stale_orders(
             ib, df, orders_by_conid, all_exchanges, state)
 
-        # Phase 2: Compute net quantities with remaining orders.
+        # Phase 2: Cancel superfluous orders (wrong direction or
+        # overshooting the target) to avoid counter-orders.
+        remaining_orders, superfluous_counts = _cancel_superfluous_orders(
+            ib, df, remaining_orders, positions, all_exchanges, state)
+
+        # Phase 3: Compute net quantities with remaining orders.
         df = compute_net_quantities(df, positions, remaining_orders)
+        cancelled_counts = [
+            s + p for s, p in zip(stale_counts, superfluous_counts)
+        ]
         df["cancelled_orders"] = cancelled_counts
 
     # ------------------------------------------------------------------

@@ -44,12 +44,16 @@ class TestStartGateway:
     @patch("src.gateway._wait_for_gateway")
     @patch("src.gateway.subprocess.Popen")
     @patch("src.gateway.os.path.isfile", return_value=True)
-    def test_launches_ibc_script(self, mock_isfile, mock_popen, mock_wait):
+    @patch("src.gateway.os.makedirs")
+    @patch("builtins.open", new_callable=MagicMock)
+    def test_launches_ibc_script(self, mock_open, mock_makedirs,
+                                  mock_isfile, mock_popen, mock_wait):
         proc = start_gateway(timeout=10)
         mock_popen.assert_called_once()
-        call_args = mock_popen.call_args
-        assert "GATEWAY" in call_args.kwargs["env"]["APP"]
-        mock_wait.assert_called_once_with(10)
+        cmd = mock_popen.call_args.kwargs.get("args", mock_popen.call_args[0][0])
+        assert "--gateway" in cmd
+        assert mock_wait.call_count == 1
+        assert mock_wait.call_args[0][0] == 10
 
     @patch("src.gateway.os.path.isfile", return_value=False)
     def test_raises_if_script_missing(self, mock_isfile):
@@ -59,13 +63,18 @@ class TestStartGateway:
     @patch("src.gateway._wait_for_gateway")
     @patch("src.gateway.subprocess.Popen")
     @patch("src.gateway.os.path.isfile", return_value=True)
-    def test_env_contains_required_vars(self, mock_isfile, mock_popen, mock_wait):
+    @patch("src.gateway.os.makedirs")
+    @patch("builtins.open", new_callable=MagicMock)
+    def test_cmd_contains_required_args(self, mock_open, mock_makedirs,
+                                         mock_isfile, mock_popen, mock_wait):
         start_gateway(timeout=5)
-        env = mock_popen.call_args.kwargs["env"]
-        for key in ("TWS_MAJOR_VRSN", "IBC_INI", "IBC_PATH", "TWS_PATH",
-                     "TRADING_MODE", "APP", "LOG_PATH"):
-            assert key in env, f"Missing env var: {key}"
-        assert env["APP"] == "GATEWAY"
+        cmd = mock_popen.call_args.kwargs.get("args", mock_popen.call_args[0][0])
+        cmd_str = " ".join(cmd)
+        assert "--gateway" in cmd_str
+        assert "--tws-path=" in cmd_str
+        assert "--ibc-path=" in cmd_str
+        assert "--ibc-ini=" in cmd_str
+        assert "--mode=" in cmd_str
 
 
 class TestWaitForGateway:

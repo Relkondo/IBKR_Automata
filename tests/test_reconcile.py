@@ -13,6 +13,7 @@ from src.reconcile import (
     compute_net_quantities,
     _is_order_stale,
     _cancel_stale_orders,
+    _cancel_superfluous_orders,
     reconcile,
 )
 
@@ -285,7 +286,10 @@ class TestReconcile:
         assert len(result) >= 2  # at least original rows
 
     def test_auto_mode_sets_confirm_all(self, mock_ib):
-        mock_ib.positions.return_value = []
+        c = MockContract(conId=265598, symbol="AAPL", currency="USD",
+                         primaryExchange="NASDAQ")
+        pos = MockPosition(contract=c, position=10)
+        mock_ib.positions.return_value = [pos]
         mock_ib.openTrades.return_value = []
 
         df = self._make_df()
@@ -311,6 +315,29 @@ class TestReconcile:
             result = reconcile(mock_ib, df, all_exchanges=True, auto_mode=True)
 
         assert result[result["conid"] == 265598].iloc[0]["cancelled_orders"] >= 1
+        mock_ib.cancelOrder.assert_called()
+
+    def test_superfluous_order_cancelled_not_counter_ordered(self, mock_ib):
+        """A superfluous BUY on-target is cancelled, not counter-ordered."""
+        c = MockContract(conId=265598, symbol="AAPL", currency="USD",
+                         primaryExchange="NASDAQ")
+        pos = MockPosition(contract=c, position=28)
+        mock_ib.positions.return_value = [pos]
+
+        o = MockOrder(orderId=99, action="BUY", totalQuantity=5, lmtPrice=178.50)
+        os_ = MockOrderStatus(status="Submitted", remaining=5)
+        trade = MockTrade(contract=c, order=o, orderStatus=os_)
+        mock_ib.openTrades.return_value = [trade]
+
+        df = self._make_df()
+
+        with patch("src.reconcile.is_exchange_open", return_value=True):
+            result = reconcile(mock_ib, df, all_exchanges=True, auto_mode=True)
+
+        aapl = result[result["conid"] == 265598].iloc[0]
+        # The BUY should be cancelled, not counteracted with a SELL.
+        assert aapl["net_quantity"] == 0
+        assert aapl["cancelled_orders"] >= 1
         mock_ib.cancelOrder.assert_called()
 
     def test_non_stale_orders_not_cancelled(self, mock_ib):
@@ -434,3 +461,177 @@ class TestCancelStaleOrders:
         remaining, counts = _cancel_stale_orders(
             mock_ib, df, {}, True, state)
         assert counts[0] == 0
+
+
+# ── _cancel_superfluous_orders ────────────────────────────────────
+
+
+class TestCancelSuperfluousOrders:
+    def _make_df(self, **overrides):
+        defaults = {
+            "conid": [265598],
+            "Qty": [10],
+            "limit_price": [178.50],
+            "MIC Primary Exchange": ["XNAS"],
+            "Name": ["APPLE INC"],
+        }
+        defaults.update(overrides)
+        return pd.DataFrame(defaults)
+
+    def test_on_target_cancels_all_orders(self, mock_ib):
+        """When position == target, all pending orders are superfluous."""
+        df = self._make_df(Qty=[10])
+        positions = {265598: 10.0}
+        trade = MagicMock()
+        trade.order = MagicMock()
+        orders_by_conid = {265598: [{
+            "orderId": 50, "side": "BUY", "remainingQuantity": 5,
+            "price": 178.0, "trade": trade,
+        }]}
+        state = CancelState(confirm_all=True)
+
+        with patch("src.reconcile.is_exchange_open", return_value=True):
+            remaining, counts = _cancel_superfluous_orders(
+                mock_ib, df, orders_by_conid, positions, True, state)
+
+        assert counts[0] == 1
+        assert len(remaining.get(265598, [])) == 0
+
+    def test_wrong_direction_buy_when_need_sell(self, mock_ib):
+        """A BUY order is superfluous when the position needs to decrease."""
+        df = self._make_df(Qty=[5])
+        positions = {265598: 10.0}
+        trade = MagicMock()
+        trade.order = MagicMock()
+        orders_by_conid = {265598: [{
+            "orderId": 51, "side": "BUY", "remainingQuantity": 3,
+            "price": 178.0, "trade": trade,
+        }]}
+        state = CancelState(confirm_all=True)
+
+        with patch("src.reconcile.is_exchange_open", return_value=True):
+            remaining, counts = _cancel_superfluous_orders(
+                mock_ib, df, orders_by_conid, positions, True, state)
+
+        assert counts[0] == 1
+        assert len(remaining.get(265598, [])) == 0
+
+    def test_wrong_direction_sell_when_need_buy(self, mock_ib):
+        """A SELL order is superfluous when the position needs to increase."""
+        df = self._make_df(Qty=[20])
+        positions = {265598: 10.0}
+        trade = MagicMock()
+        trade.order = MagicMock()
+        orders_by_conid = {265598: [{
+            "orderId": 52, "side": "SELL", "remainingQuantity": 3,
+            "price": 178.0, "trade": trade,
+        }]}
+        state = CancelState(confirm_all=True)
+
+        with patch("src.reconcile.is_exchange_open", return_value=True):
+            remaining, counts = _cancel_superfluous_orders(
+                mock_ib, df, orders_by_conid, positions, True, state)
+
+        assert counts[0] == 1
+        assert len(remaining.get(265598, [])) == 0
+
+    def test_overshooting_orders_trimmed(self, mock_ib):
+        """When right-direction orders exceed the need, excess is cancelled."""
+        df = self._make_df(Qty=[15])
+        positions = {265598: 10.0}  # need = +5
+        t1 = MagicMock(); t1.order = MagicMock()
+        t2 = MagicMock(); t2.order = MagicMock()
+        orders_by_conid = {265598: [
+            {"orderId": 60, "side": "BUY", "remainingQuantity": 3,
+             "price": 178.0, "trade": t1},
+            {"orderId": 61, "side": "BUY", "remainingQuantity": 5,
+             "price": 178.0, "trade": t2},
+        ]}
+        state = CancelState(confirm_all=True)
+
+        with patch("src.reconcile.is_exchange_open", return_value=True):
+            remaining, counts = _cancel_superfluous_orders(
+                mock_ib, df, orders_by_conid, positions, True, state)
+
+        # BUY 3 fits (3 <= 5), BUY 5 overshoots (3+5=8 > 5) → cancelled
+        assert counts[0] == 1
+        assert len(remaining[265598]) == 1
+        assert remaining[265598][0]["orderId"] == 60
+
+    def test_right_direction_within_budget_kept(self, mock_ib):
+        """Orders in the right direction that don't overshoot are kept."""
+        df = self._make_df(Qty=[20])
+        positions = {265598: 10.0}  # need = +10
+        orders_by_conid = {265598: [{
+            "orderId": 70, "side": "BUY", "remainingQuantity": 5,
+            "price": 178.0, "trade": MagicMock(),
+        }]}
+        state = CancelState(confirm_all=True)
+
+        with patch("src.reconcile.is_exchange_open", return_value=True):
+            remaining, counts = _cancel_superfluous_orders(
+                mock_ib, df, orders_by_conid, positions, True, state)
+
+        assert counts[0] == 0
+        assert len(remaining[265598]) == 1
+
+    def test_no_orders_no_change(self, mock_ib):
+        df = self._make_df()
+        state = CancelState()
+        remaining, counts = _cancel_superfluous_orders(
+            mock_ib, df, {}, {}, True, state)
+        assert counts[0] == 0
+
+    def test_nan_conid_skipped(self, mock_ib):
+        df = self._make_df(conid=[None])
+        state = CancelState()
+        remaining, counts = _cancel_superfluous_orders(
+            mock_ib, df, {}, {}, True, state)
+        assert counts[0] == 0
+
+    def test_nan_qty_skipped(self, mock_ib):
+        df = self._make_df(Qty=[None])
+        state = CancelState()
+        remaining, counts = _cancel_superfluous_orders(
+            mock_ib, df, {}, {}, True, state)
+        assert counts[0] == 0
+
+    def test_exchange_closed_skips_cancel(self, mock_ib):
+        """Superfluous orders on closed exchanges are not cancelled."""
+        df = self._make_df(Qty=[10])
+        positions = {265598: 10.0}
+        orders_by_conid = {265598: [{
+            "orderId": 80, "side": "BUY", "remainingQuantity": 5,
+            "price": 178.0, "trade": MagicMock(),
+        }]}
+        state = CancelState()
+
+        with patch("src.reconcile.is_exchange_open", return_value=False):
+            remaining, counts = _cancel_superfluous_orders(
+                mock_ib, df, orders_by_conid, positions, False, state)
+
+        assert counts[0] == 0
+        assert len(remaining[265598]) == 1
+
+    def test_mixed_orders_cancels_wrong_keeps_right(self, mock_ib):
+        """With a BUY and SELL for the same conid, only the wrong one is cancelled."""
+        df = self._make_df(Qty=[15])
+        positions = {265598: 10.0}  # need = +5
+        t_buy = MagicMock(); t_buy.order = MagicMock()
+        t_sell = MagicMock(); t_sell.order = MagicMock()
+        orders_by_conid = {265598: [
+            {"orderId": 90, "side": "BUY", "remainingQuantity": 3,
+             "price": 178.0, "trade": t_buy},
+            {"orderId": 91, "side": "SELL", "remainingQuantity": 2,
+             "price": 178.0, "trade": t_sell},
+        ]}
+        state = CancelState(confirm_all=True)
+
+        with patch("src.reconcile.is_exchange_open", return_value=True):
+            remaining, counts = _cancel_superfluous_orders(
+                mock_ib, df, orders_by_conid, positions, True, state)
+
+        assert counts[0] == 1  # SELL cancelled
+        kept_ids = [o["orderId"] for o in remaining[265598]]
+        assert 90 in kept_ids   # BUY kept
+        assert 91 not in kept_ids  # SELL cancelled

@@ -4,7 +4,7 @@ import os
 
 from src.config import (
     TWS_HOST, TWS_PORT, TWS_CLIENT_ID,
-    PROJECT_ROOT, ASSETS_DIR, OUTPUT_DIR,
+    PROJECT_ROOT, INPUT_DIR, OUTPUT_DIR,
     MINIMUM_TRADING_AMOUNT, MAXIMUM_AMOUNT_AUTOMATIC_ORDER,
     MINIMUM_CASH_RESERVE, SELL_REBALANCE_RATIO_LIMIT,
     PRICE_OFFSET, LIMIT_PRICE_OFFSET,
@@ -29,7 +29,7 @@ class TestConfigValues:
         assert os.path.isdir(os.path.join(PROJECT_ROOT, "src"))
 
     def test_assets_dir_under_project_root(self):
-        assert ASSETS_DIR.startswith(PROJECT_ROOT)
+        assert INPUT_DIR.startswith(PROJECT_ROOT)
 
     def test_output_dir_under_project_root(self):
         assert OUTPUT_DIR.startswith(PROJECT_ROOT)

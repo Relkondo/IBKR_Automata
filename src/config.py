@@ -15,17 +15,17 @@ TWS_PORT = int(os.getenv("IBKR_PORT", "4001"))
 TWS_CLIENT_ID = int(os.getenv("IBKR_CLIENT_ID", "1"))
 
 # --- IB Gateway / IBC settings (used by src/gateway.py) ---
-IBC_PATH = os.getenv("IBC_PATH", "/opt/ibc")
-IBC_INI = os.getenv("IBC_INI", os.path.expanduser("~/ibc/config.ini"))
-GATEWAY_TWS_PATH = os.getenv("TWS_PATH", os.path.expanduser("~/Applications"))
-TWS_MAJOR_VRSN = os.getenv("TWS_MAJOR_VRSN", "10.19")
+IBC_PATH = os.path.expanduser(os.getenv("IBC_PATH", "/opt/ibc"))
+IBC_INI = os.path.expanduser(os.getenv("IBC_INI", "~/ibc/config.ini"))
+GATEWAY_TWS_PATH = os.path.expanduser(os.getenv("TWS_PATH", "~/Applications"))
+TWS_MAJOR_VRSN = os.getenv("TWS_MAJOR_VRSN", "10.37")
 TRADING_MODE = os.getenv("TRADING_MODE", "paper")
 GATEWAY_STARTUP_TIMEOUT = int(os.getenv("GATEWAY_STARTUP_TIMEOUT", "120"))
 
 # --- Paths ---
 # Resolve relative to the project root (parent of src/)
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-ASSETS_DIR = os.path.join(PROJECT_ROOT, "assets")
+INPUT_DIR = os.path.join(PROJECT_ROOT, "assets")
 OUTPUT_DIR = os.path.join(PROJECT_ROOT, "output")
 
 # --- Trading thresholds ---

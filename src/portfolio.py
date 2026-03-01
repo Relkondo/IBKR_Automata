@@ -15,7 +15,7 @@ import re
 import pandas as pd
 
 from src.config import (
-    ASSETS_DIR, IGNORE_NAMES,
+    INPUT_DIR, IGNORE_NAMES,
     OPTION_TICKER_REDIRECTS, STOCK_TICKER_REDIRECTS,
 )
 
@@ -203,7 +203,7 @@ def load_portfolio(xlsx_path: str | None = None) -> pd.DataFrame:
         Filtered portfolio table with additional helper columns:
         ``is_option`` and ``clean_ticker``.
     """
-    path = xlsx_path or _latest_xlsx(ASSETS_DIR)
+    path = xlsx_path or _latest_xlsx(INPUT_DIR)
     print(f"Reading portfolio from {path} ...")
 
     df = pd.read_excel(path, engine="openpyxl")

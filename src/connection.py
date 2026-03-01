@@ -111,5 +111,15 @@ def connect(*, auto_start_gateway: bool = False) -> IB:
     accounts = ib.managedAccounts()
     if not accounts:
         raise RuntimeError("No managed accounts returned by IBKR.")
+
+    # IB Gateway (unlike TWS) doesn't connect to data farms until a
+    # request is made.  The startup fetch may return empty because the
+    # data-farm link isn't established yet.  Force a fresh sync so
+    # downstream code never sees stale/empty caches.
+    ib.reqPositions()
+    ib.reqAllOpenOrders()
+    ib.reqAccountSummary()
+    ib.sleep(2)
+
     print(f"Connected to IBKR (account: {accounts[0]})\n")
     return ib

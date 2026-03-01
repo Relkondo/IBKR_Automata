@@ -176,16 +176,19 @@ All limit prices are snapped to valid tick increments using IBKR market rules to
 
 For fully unattended execution (e.g. via `cron`), IBKR Automata can start **IB Gateway** automatically through [IBC](https://github.com/IbcAlpha/IBC). IB Gateway is a lightweight headless alternative to TWS that exposes the same API.
 
-### 1. Install IB Gateway
+### 1. TWS installation (includes Gateway)
 
-Download the **offline** (stable) installer from [Interactive Brokers](https://www.interactivebrokers.com/en/trading/ibgateway-stable.php) and run it. On macOS it installs to `~/Applications`.
+A TWS installation already contains the IB Gateway code -- no separate download is needed. IBC can launch Gateway mode directly from the TWS install at `~/Applications/Trader Workstation/`.
 
-After installation, launch IB Gateway once manually, log in, and configure the API settings (*Configure → Settings → API → Settings*):
+If you haven't installed TWS yet, download the **offline** (stable) installer from [Interactive Brokers](https://www.interactivebrokers.com/en/trading/tws.php). On macOS it installs to `~/Applications`.
+
+Make sure the following API settings are configured in TWS (*Edit → Global Configuration → API → Settings*):
 
 - Check **Enable ActiveX and Socket Clients**
 - Check **Download open orders on connection**
-- Note the Socket port (default 4001 for live, 4002 for paper)
 - Increase Memory Allocation to at least 4096 MB
+
+When IBC launches Gateway mode from the TWS installation, it listens on port 4001 (live) or 4002 (paper) by default.
 
 ### 2. Install IBC
 
@@ -201,7 +204,7 @@ sudo mkdir -p /opt/ibc
 sudo unzip /tmp/ibc.zip -d /opt/ibc
 sudo chmod +x /opt/ibc/scripts/*.sh
 
-# Create the config directory
+# Create ~/ibc/ (for config.ini) and ~/ibc/logs/ (for IBC diagnostics)
 mkdir -p ~/ibc/logs
 ```
 
@@ -242,7 +245,7 @@ Add IBC settings to your `.env` file (see `.env.example`):
 ```bash
 IBKR_PORT=4001          # or 4002 for paper
 TRADING_MODE=live       # or paper
-TWS_MAJOR_VRSN=10.19   # check via Help > About in IB Gateway
+TWS_MAJOR_VRSN=10.44   # check via Help > About in TWS, or tail ~/Jts/launcher.log
 ```
 
 ### 5. Set up the cron job
