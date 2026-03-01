@@ -64,11 +64,13 @@ class _OrderParams:
 # ==================================================================
 
 def cancel_all_orders(ib: IB,
-                      all_exchanges: bool = False) -> None:
+                      all_exchanges: bool = False,
+                      auto_mode: bool = False) -> None:
     """Fetch every open order and attempt to cancel each one.
 
     When *all_exchanges* is ``False`` (the default), only cancel
     orders whose exchange is currently open.
+    When *auto_mode* is ``True``, all cancellations are automatic.
     """
     print("Fetching open orders ...")
     open_trades = ib.openTrades()
@@ -82,7 +84,7 @@ def cancel_all_orders(ib: IB,
     cancelled = 0
     failed = 0
     skipped = 0
-    state = CancelState()
+    state = CancelState(confirm_all=auto_mode)
 
     for trade in open_trades:
         c = trade.contract
@@ -305,6 +307,7 @@ def _place_single_order(
     deferred_orders: list[_OrderParams] | None = None,
     rejected_orders: list[dict] | None = None,
     large_orders: list[dict] | None = None,
+    auto_mode: bool = False,
 ) -> str:
     """Run the prompt-loop for one order.
 
@@ -322,21 +325,35 @@ def _place_single_order(
             state.confirm_all or p.mic_str in state.confirm_exchanges
         )
         if is_auto:
-            # Guardrail: defer large orders for explicit approval.
             usd_val = _compute_usd_amount(
                 p.limit_price, p.quantity, p.multiplier, p.fx)
-            if (deferred_orders is not None
-                    and usd_val > MAXIMUM_AMOUNT_AUTOMATIC_ORDER):
-                print(
-                    f"  (deferred — USD amount "
-                    f"{_format_currency(usd_val)} exceeds "
-                    f"{_format_currency(MAXIMUM_AMOUNT_AUTOMATIC_ORDER)}"
-                    f" auto-confirm threshold)")
-                deferred_orders.append(p)
-                if large_orders is not None:
-                    large_orders.append(
-                        _order_summary(p, status="deferred"))
-                return "next"
+            if usd_val > MAXIMUM_AMOUNT_AUTOMATIC_ORDER:
+                if auto_mode:
+                    # -auto: reject large orders outright.
+                    print(
+                        f"  (REJECTED — USD amount "
+                        f"{_format_currency(usd_val)} exceeds "
+                        f"{_format_currency(MAXIMUM_AMOUNT_AUTOMATIC_ORDER)}"
+                        f" auto limit)")
+                    if rejected_orders is not None:
+                        rejected_orders.append(_order_summary(
+                            p, reason="Amount exceeds auto limit"))
+                    if large_orders is not None:
+                        large_orders.append(
+                            _order_summary(p, status="rejected"))
+                    return "next"
+                elif deferred_orders is not None:
+                    # Interactive: defer for manual approval later.
+                    print(
+                        f"  (deferred — USD amount "
+                        f"{_format_currency(usd_val)} exceeds "
+                        f"{_format_currency(MAXIMUM_AMOUNT_AUTOMATIC_ORDER)}"
+                        f" auto-confirm threshold)")
+                    deferred_orders.append(p)
+                    if large_orders is not None:
+                        large_orders.append(
+                            _order_summary(p, status="deferred"))
+                    return "next"
             choice = "Y"
             print("  (auto-confirmed)")
         else:
@@ -580,12 +597,15 @@ def _prepare_order_params(
 # Main loop
 # ==================================================================
 
-def run_order_loop(ib: IB, df: pd.DataFrame) -> list[dict]:
-    """Iterate over the portfolio and interactively place orders.
+def run_order_loop(ib: IB, df: pd.DataFrame,
+                   auto_mode: bool = False) -> list[dict]:
+    """Iterate over the portfolio and place orders.
+
+    When *auto_mode* is ``True``, all orders are auto-confirmed,
+    large orders are rejected outright, and a Telegram summary is
+    sent at the end.  In interactive mode no Telegram is sent.
 
     Returns a list of summary records for successfully placed orders.
-    After all orders, sends a Telegram notification with
-    rejected/cancelled and large orders.
     """
     ensure_connected(ib)
 
@@ -593,7 +613,7 @@ def run_order_loop(ib: IB, df: pd.DataFrame) -> list[dict]:
     deferred_orders: list[_OrderParams] = []
     rejected_orders: list[dict] = []
     large_orders: list[dict] = []
-    state = _AutoState()
+    state = _AutoState(confirm_all=auto_mode)
     total = len(df)
 
     for idx, row in df.iterrows():
@@ -605,11 +625,13 @@ def run_order_loop(ib: IB, df: pd.DataFrame) -> list[dict]:
             deferred_orders=deferred_orders,
             rejected_orders=rejected_orders,
             large_orders=large_orders,
+            auto_mode=auto_mode,
         )
         if signal == "quit":
             break
 
-    # Process deferred large orders (explicit manual approval required).
+    # Process deferred large orders (interactive only — in auto mode
+    # large orders are rejected immediately so nothing is deferred).
     if deferred_orders:
         n = len(deferred_orders)
         print(f"\n{'=' * 78}")
@@ -628,9 +650,10 @@ def run_order_loop(ib: IB, df: pd.DataFrame) -> list[dict]:
             if signal == "quit":
                 break
 
-    # Send Telegram notification for flagged orders.
-    from src.telegram import notify_flagged_orders
-    notify_flagged_orders(rejected_orders, large_orders)
+    # Telegram notification (auto mode only).
+    if auto_mode:
+        from src.telegram import notify_flagged_orders
+        notify_flagged_orders(rejected_orders, large_orders)
 
     return placed_orders
 

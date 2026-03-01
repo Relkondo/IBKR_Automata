@@ -322,12 +322,16 @@ def _cancel_stale_orders(
 def reconcile(ib: IB,
               df: pd.DataFrame,
               all_exchanges: bool = True,
-              dry_run: bool = False) -> pd.DataFrame:
+              dry_run: bool = False,
+              auto_mode: bool = False) -> pd.DataFrame:
     """Compute net quantities and optionally cancel stale orders.
 
     When *dry_run* is ``True``, no orders are cancelled — all pending
     orders are counted as-is and extra positions produce synthetic rows
     for read-only display.  Useful for comparisons.
+
+    When *auto_mode* is ``True``, all cancellation prompts are
+    auto-confirmed (equivalent to user pressing Cancel All).
 
     1. Cancel stale orders (skipped in dry-run).
     2. Compute net quantities using ``compute_net_quantities``.
@@ -349,7 +353,7 @@ def reconcile(ib: IB,
 
     # Cancel consent state is shared between stale-order and
     # extra-position cancellation so user choices carry over.
-    state = CancelState()
+    state = CancelState(confirm_all=auto_mode)
 
     if dry_run:
         # Read-only: skip cancellation, count all orders as pending.

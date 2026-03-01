@@ -402,13 +402,17 @@ def _fetch_web_fx_rate(ccy: str) -> float | None:
     return None
 
 
-def resolve_fx_rate(ib: IB, ccy: str) -> float | None:
+def resolve_fx_rate(ib: IB, ccy: str,
+                    auto_mode: bool = False) -> float | None:
     """Obtain the USD -> *ccy* exchange rate.
 
     Strategy (in order):
       1. IBKR Forex snapshot (standard pair convention, then reverse).
       2. Free web API (open.er-api.com — covers exotic pairs like TWD).
-      3. Manual user input as a last resort.
+      3. Manual user input as a last resort (interactive only).
+
+    In *auto_mode*, raises ``RuntimeError`` if the rate cannot be
+    resolved (instead of prompting for manual input).
 
     Returns the rate (units of *ccy* per 1 USD) or None.
     """
@@ -445,7 +449,12 @@ def resolve_fx_rate(ib: IB, ccy: str) -> float | None:
         print(f"  USD -> {ccy} = {web_rate} (web)")
         return web_rate
 
-    # --- Attempt 3: manual input ---
+    # --- Attempt 3: manual input (interactive) or abort (auto) ---
+    if auto_mode:
+        raise RuntimeError(
+            f"Could not resolve FX rate for {ccy} "
+            f"(IBKR and web API both failed)")
+
     print(f"  [!] Could not fetch Forex rate for {ccy}.")
     user_input = input(
         f"  Enter USD -> {ccy} rate (or press Enter to skip {ccy}): "
@@ -466,7 +475,8 @@ def resolve_fx_rate(ib: IB, ccy: str) -> float | None:
     return None
 
 
-def resolve_currencies(ib: IB, df: pd.DataFrame) -> pd.DataFrame:
+def resolve_currencies(ib: IB, df: pd.DataFrame,
+                       auto_mode: bool = False) -> pd.DataFrame:
     """Add ``fx_rate`` column to the portfolio table.
 
     Reads the ``currency`` column (populated by ``resolve_conids``)
@@ -496,7 +506,7 @@ def resolve_currencies(ib: IB, df: pd.DataFrame) -> pd.DataFrame:
 
     fx_rates: dict[str, float] = {"USD": 1.0}
     for ccy in sorted(unique_currencies):
-        resolved = resolve_fx_rate(ib, ccy)
+        resolved = resolve_fx_rate(ib, ccy, auto_mode=auto_mode)
         if resolved is not None:
             fx_rates[ccy] = resolved
 

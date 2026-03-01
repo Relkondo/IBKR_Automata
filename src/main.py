@@ -28,6 +28,10 @@ CLI arguments
   -all-exchanges     Operate on all exchanges regardless of trading hours.
                      By default, only currently open exchanges are used
                      for placing and cancelling orders.
+  -auto              Fully autonomous mode (no user prompts).  Orders are
+                     auto-confirmed, large orders are rejected, FX failures
+                     stop the script, and Telegram notifications are sent.
+                     Designed for cron-job execution.
 """
 
 import os
@@ -73,6 +77,7 @@ def main() -> None:
     cancel_all = "cancel-all-orders" in args
     print_comparison = "print-project-vs-current" in args
     all_exchanges = "-all-exchanges" in args
+    auto_mode = "-auto" in args
 
     # Mutual exclusivity checks.
     mode_flags = sum([noop, noop_recalc, use_saved, cancel_all,
@@ -110,19 +115,28 @@ def main() -> None:
     if all_exchanges:
         print("ALL-EXCHANGES mode -- "
               "operating on all exchanges regardless of trading hours.\n")
+    if auto_mode:
+        print("AUTO mode -- fully autonomous, no user prompts.\n")
 
     # ------------------------------------------------------------------
     # 1. Connect to TWS
     # ------------------------------------------------------------------
-    print("Connecting to TWS ...")
-    ib = connect()
+    try:
+        print("Connecting to TWS ...")
+        ib = connect()
+    except Exception as exc:
+        if auto_mode:
+            from src.telegram import send_message
+            send_message(f"*IBKR Automata — Error*\n\n`{exc}`")
+        raise
 
     try:
         # ==============================================================
         # cancel-all-orders  (standalone mode)
         # ==============================================================
         if cancel_all:
-            cancel_all_orders(ib, all_exchanges=all_exchanges)
+            cancel_all_orders(ib, all_exchanges=all_exchanges,
+                              auto_mode=auto_mode)
 
         # ==============================================================
         # project-portfolio / print-project-vs-current
@@ -143,7 +157,7 @@ def main() -> None:
             df["Dollar Allocation"] = (df["Basket Allocation"] / 100 * net_liq).round(2)
 
             # Resolve currencies & exchange rates.
-            df = resolve_currencies(ib, df)
+            df = resolve_currencies(ib, df, auto_mode=auto_mode)
 
             # Fetch market data & compute limit prices.
             df = fetch_market_data(ib, df)
@@ -168,7 +182,7 @@ def main() -> None:
             df = resolve_conids(ib, df)
 
             # 3b. Resolve currencies & exchange rates.
-            df = resolve_currencies(ib, df)
+            df = resolve_currencies(ib, df, auto_mode=auto_mode)
 
             # 4. Fetch market data & compute limit prices.
             df = fetch_market_data(ib, df)
@@ -186,7 +200,8 @@ def main() -> None:
                 print("Reconciling target portfolio with IBKR state ...\n")
                 df = reconcile(ib, df,
                                all_exchanges=all_exchanges,
-                               dry_run=print_comparison)
+                               dry_run=print_comparison,
+                               auto_mode=auto_mode)
 
             if print_comparison:
                 # 6a. Write comparison Excel instead of placing orders.
@@ -197,8 +212,8 @@ def main() -> None:
                     print("Filtering to currently open exchanges ...\n")
                     df = filter_df_by_open_exchange(df)
 
-                # 6. Interactive order loop.
-                placed = run_order_loop(ib, df)
+                # 6. Order loop (auto-confirmed in -auto mode).
+                placed = run_order_loop(ib, df, auto_mode=auto_mode)
 
                 # 7. Summary.
                 print_order_summary(placed)
@@ -208,6 +223,11 @@ def main() -> None:
                   "Review Project_Portfolio.csv in the output directory."
                   + (" (market data refreshed)" if noop_recalc else ""))
 
+    except Exception as exc:
+        if auto_mode:
+            from src.telegram import send_message
+            send_message(f"*IBKR Automata — Error*\n\n`{exc}`")
+        raise
     finally:
         # 8. Disconnect.
         ib.disconnect()
