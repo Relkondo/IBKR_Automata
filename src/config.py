@@ -6,10 +6,21 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# --- TWS connection ---
-TWS_HOST = "127.0.0.1"
-TWS_PORT = 7497
-TWS_CLIENT_ID = 1
+# --- IBKR connection ---
+# Defaults target IB Gateway live.  Override via .env or shell env vars.
+# Ports: 4001 = Gateway live, 4002 = Gateway paper,
+#        7496 = TWS live,     7497 = TWS paper
+TWS_HOST = os.getenv("IBKR_HOST", "127.0.0.1")
+TWS_PORT = int(os.getenv("IBKR_PORT", "4001"))
+TWS_CLIENT_ID = int(os.getenv("IBKR_CLIENT_ID", "1"))
+
+# --- IB Gateway / IBC settings (used by src/gateway.py) ---
+IBC_PATH = os.getenv("IBC_PATH", "/opt/ibc")
+IBC_INI = os.getenv("IBC_INI", os.path.expanduser("~/ibc/config.ini"))
+GATEWAY_TWS_PATH = os.getenv("TWS_PATH", os.path.expanduser("~/Applications"))
+TWS_MAJOR_VRSN = os.getenv("TWS_MAJOR_VRSN", "10.19")
+TRADING_MODE = os.getenv("TRADING_MODE", "paper")
+GATEWAY_STARTUP_TIMEOUT = int(os.getenv("GATEWAY_STARTUP_TIMEOUT", "120"))
 
 # --- Paths ---
 # Resolve relative to the project root (parent of src/)

@@ -15,7 +15,9 @@ Given an Excel file describing a target portfolio (tickers, allocations, exchang
 ## Prerequisites
 
 - **Python 3.12+** (managed via [pyenv](https://github.com/pyenv/pyenv))
-- **Trader Workstation (TWS)** — download from [Interactive Brokers](https://www.interactivebrokers.com/en/trading/tws.php). TWS must be running and authenticated before launching IBKR Automata. Enable the API in TWS settings: *Edit → Global Configuration → API → Settings* — check "Enable ActiveX and Socket Clients" and note the port (default: 7497 for paper, 7496 for live).
+- **TWS or IB Gateway** — at least one must be running and authenticated before launching IBKR Automata (in `-auto` mode the program can start IB Gateway itself; see [Automated / Cron Setup](#automated--cron-setup) below).
+  - *Interactive use*: [Trader Workstation (TWS)](https://www.interactivebrokers.com/en/trading/tws.php) — port 7497 (paper) / 7496 (live).
+  - *Unattended / cron use*: [IB Gateway](https://www.interactivebrokers.com/en/trading/ibgateway-stable.php) — lighter (~40 % fewer resources), no inactivity lock-out, same API — port 4002 (paper) / 4001 (live).
 
 ## Setup
 
@@ -34,16 +36,20 @@ pip install -r requirements.txt
 
 ### Configuration
 
-Edit `src/config.py` to match your environment:
+Connection settings are read from environment variables (`.env` file or shell). Edit `.env` or export them directly. Tuning parameters live in `src/config.py`.
+
+| Env var | Default | Description |
+|---|---|---|
+| `IBKR_HOST` | `127.0.0.1` | IBKR API host. |
+| `IBKR_PORT` | `4001` | API port. `4001` = Gateway live, `4002` = Gateway paper, `7496` = TWS live, `7497` = TWS paper. |
+| `IBKR_CLIENT_ID` | `1` | Client ID for the API connection. |
+
+Trading thresholds (in `src/config.py`):
 
 | Setting | Default | Description |
 |---|---|---|
-| `TWS_HOST` | `127.0.0.1` | TWS API host. |
-| `TWS_PORT` | `7497` | TWS API port (`7497` paper, `7496` live). |
-| `TWS_CLIENT_ID` | `1` | Client ID for the API connection. |
-| `FILL_PATIENCE` | `20` | Limit-price aggressiveness (0 = cross spread, 100 = passive). See [Limit price formula](#limit-price-formula). |
 | `MINIMUM_TRADING_AMOUNT` | `100` | USD — net orders below this value are skipped. |
-| `MAXIMUM_AMOUNT_AUTOMATIC_ORDER` | `10,000` | USD — auto-confirmed orders above this are deferred for manual approval. |
+| `MAXIMUM_AMOUNT_AUTOMATIC_ORDER` | `1,500` | USD — auto-confirmed orders above this are deferred for manual approval. |
 | `STALE_ORDER_TOL_PCT` | `0.005` | Fraction — stale-order price tolerance (0.5 %). |
 | `STALE_ORDER_TOL_PCT_ILLIQUID` | `0.05` | Fraction — wider tolerance for illiquid exchanges (5 %). |
 
@@ -65,7 +71,7 @@ Place your portfolio Excel file (`.xlsx`) in the `assets/` directory. The file m
 python -m src.main [options]
 ```
 
-Before launching, make sure TWS is running and authenticated. The program connects to TWS automatically — no browser authentication step is needed.
+Before launching, make sure TWS or IB Gateway is running and authenticated (or use `-auto` mode with IBC to start it automatically — see [Automated / Cron Setup](#automated--cron-setup)).
 
 ### Modes
 
@@ -79,6 +85,7 @@ Before launching, make sure TWS is running and authenticated. The program connec
 | `cancel-all-orders` | Cancel every open order on the account and exit. |
 | `print-project-vs-current` | Load `Project_Portfolio.csv` and current IBKR positions, then output an Excel comparison (`output/Project_VS_Current.xlsx`) showing target vs current allocations. |
 | `-all-exchanges` | Operate on **all** exchanges regardless of trading hours. By default, only currently open exchanges are considered when placing or cancelling orders. Has no effect with `noop` or `noop-recalculate`. Compatible with all other arguments. |
+| `-auto` | Fully autonomous mode (no user prompts). Auto-confirms orders, rejects large orders, sends Telegram notifications on errors. **Automatically starts IB Gateway via IBC if it is not already running** — designed for cron-job execution. |
 
 `noop`, `noop-recalculate`, `project-portfolio`, `cancel-all-orders`, and `print-project-vs-current` are mutually exclusive. `buy-all` can be combined with `project-portfolio`.
 
@@ -165,6 +172,105 @@ When bid/ask is unavailable, the limit price falls back to `last`, then `close`.
 
 All limit prices are snapped to valid tick increments using IBKR market rules to avoid order rejections.
 
+## Automated / Cron Setup
+
+For fully unattended execution (e.g. via `cron`), IBKR Automata can start **IB Gateway** automatically through [IBC](https://github.com/IbcAlpha/IBC). IB Gateway is a lightweight headless alternative to TWS that exposes the same API.
+
+### 1. Install IB Gateway
+
+Download the **offline** (stable) installer from [Interactive Brokers](https://www.interactivebrokers.com/en/trading/ibgateway-stable.php) and run it. On macOS it installs to `~/Applications`.
+
+After installation, launch IB Gateway once manually, log in, and configure the API settings (*Configure → Settings → API → Settings*):
+
+- Check **Enable ActiveX and Socket Clients**
+- Check **Download open orders on connection**
+- Note the Socket port (default 4001 for live, 4002 for paper)
+- Increase Memory Allocation to at least 4096 MB
+
+### 2. Install IBC
+
+[IBC](https://github.com/IbcAlpha/IBC) automates IB Gateway login, dialog handling, and daily restarts.
+
+```bash
+# Download the latest macOS release
+curl -L -o /tmp/ibc.zip \
+  https://github.com/IbcAlpha/IBC/releases/latest/download/IBCMacos-3.23.0.zip
+
+# Install to /opt/ibc
+sudo mkdir -p /opt/ibc
+sudo unzip /tmp/ibc.zip -d /opt/ibc
+sudo chmod +x /opt/ibc/scripts/*.sh
+
+# Create the config directory
+mkdir -p ~/ibc/logs
+```
+
+### 3. Configure IBC
+
+Create `~/ibc/config.ini` with your credentials. A minimal config:
+
+```ini
+IbLoginId=your_username
+IbPassword=your_password
+TradingMode=live
+
+# Auto-accept API connections from localhost
+AcceptIncomingConnectionAction=accept
+
+# Accept paper-trading dialog automatically
+AcceptNonBrokerageAccountWarning=yes
+
+# Handle the "US stocks market data in shares" dialog
+AcceptBidAskLastSizeDisplayUpdateNotification=accept
+
+# Allow blind trading (orders without market data subscription)
+AllowBlindTrading=yes
+
+# 2FA: retry automatically if you miss the alert
+ReloginAfterSecondFactorAuthenticationTimeout=yes
+
+# Daily auto-restart (no re-auth needed Mon–Sat)
+AutoRestartTime=11:55 PM
+```
+
+> **Security:** Restrict permissions on the config file: `chmod 600 ~/ibc/config.ini`.
+
+### 4. Configure environment variables
+
+Add IBC settings to your `.env` file (see `.env.example`):
+
+```bash
+IBKR_PORT=4001          # or 4002 for paper
+TRADING_MODE=live       # or paper
+TWS_MAJOR_VRSN=10.19   # check via Help > About in IB Gateway
+```
+
+### 5. Set up the cron job
+
+```bash
+crontab -e
+```
+
+Example — run every weekday at 9:30 AM Eastern:
+
+```cron
+SHELL=/bin/zsh
+30 9 * * 1-5 cd /path/to/IBKR_Automata && /path/to/.pyenv/versions/ibkr-automata/bin/python -m src.main -auto -all-exchanges >> ~/ibc/logs/automata.log 2>&1
+```
+
+In `-auto` mode the program will:
+1. Check if IB Gateway is already listening on the configured port.
+2. If not, start it via IBC and wait for it to accept connections (up to `GATEWAY_STARTUP_TIMEOUT` seconds, default 120).
+3. Connect, run the full pipeline, and disconnect.
+
+### Two-Factor Authentication notes
+
+- **Daily auto-restarts** (Mon–Sat) do *not* require 2FA.
+- **Weekly cold restart** (Sundays, after IBKR's Saturday-night server reset) requires acknowledging one 2FA prompt on the IBKR Mobile app.
+- If IB Gateway crashes mid-week and needs a fresh start, 2FA is required again. IBC's `ReloginAfterSecondFactorAuthenticationTimeout=yes` will keep retrying, giving you multiple chances to acknowledge.
+
+---
+
 ## Project structure
 
 ```
@@ -173,8 +279,9 @@ IBKR_Automata/
 ├── output/                  # Generated Project_Portfolio.csv
 ├── src/
 │   ├── main.py              # CLI entry point & workflow orchestration
-│   ├── config.py            # Centralized settings (TWS, thresholds, tuning)
+│   ├── config.py            # Centralized settings (connection, thresholds, tuning)
 │   ├── connection.py        # ib_async IB() connection wrapper
+│   ├── gateway.py           # IB Gateway lifecycle management via IBC
 │   ├── portfolio.py         # Excel loading & preprocessing
 │   ├── contracts.py         # Contract ID resolution (stocks, options, fallbacks)
 │   ├── market_data.py       # Market data, limit prices, FX & tick-size helpers

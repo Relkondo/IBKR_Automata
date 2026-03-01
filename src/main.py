@@ -1,7 +1,7 @@
-"""IBKR Automata – entry point (TWS API via ib_async).
+"""IBKR Automata – entry point (TWS / IB Gateway API via ib_async).
 
 Orchestrates the full portfolio-order workflow:
-  1. Connect to a running Trader Workstation (TWS) instance.
+  1. Connect to a running TWS or IB Gateway instance.
   2. Read and filter the portfolio from an Excel file.
   3. Resolve contract IDs (conids) for every position.
   4. Fetch live market data and compute limit prices.
@@ -31,7 +31,9 @@ CLI arguments
   -auto              Fully autonomous mode (no user prompts).  Orders are
                      auto-confirmed, large orders are rejected, FX failures
                      stop the script, and Telegram notifications are sent.
-                     Designed for cron-job execution.
+                     Designed for cron-job execution.  When combined with
+                     IBC configuration, automatically starts IB Gateway if
+                     it is not already running.
 """
 
 import os
@@ -119,11 +121,11 @@ def main() -> None:
         print("AUTO mode -- fully autonomous, no user prompts.\n")
 
     # ------------------------------------------------------------------
-    # 1. Connect to TWS
+    # 1. Connect to IBKR (TWS or IB Gateway)
     # ------------------------------------------------------------------
     try:
-        print("Connecting to TWS ...")
-        ib = connect()
+        print("Connecting to IBKR ...")
+        ib = connect(auto_start_gateway=auto_mode)
     except Exception as exc:
         if auto_mode:
             from src.telegram import send_message
@@ -229,7 +231,7 @@ def main() -> None:
     finally:
         # 8. Disconnect.
         ib.disconnect()
-        print("Disconnected from TWS.")
+        print("Disconnected from IBKR.")
 
 
 if __name__ == "__main__":

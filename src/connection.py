@@ -1,7 +1,7 @@
-"""Connect to TWS via ib_async.
+"""Connect to IBKR (TWS or IB Gateway) via ib_async.
 
 Provides a thin wrapper that establishes a connection to a running
-Trader Workstation instance and returns the ``IB`` handle used by
+TWS or IB Gateway instance and returns the ``IB`` handle used by
 all other modules.  Also provides a ``suppress_errors`` context
 manager for silencing specific IBKR error codes.
 """
@@ -81,18 +81,28 @@ def ensure_connected(ib: IB) -> None:
 # Connection
 # ==================================================================
 
-def connect() -> IB:
-    """Connect to TWS and return the IB handle.
+def connect(*, auto_start_gateway: bool = False) -> IB:
+    """Connect to IBKR (TWS or IB Gateway) and return the IB handle.
 
-    TWS must already be running and authenticated.  Market data type
-    is set to 3 (delayed): live data is returned when a subscription
-    exists, otherwise TWS automatically provides 15-min delayed data.
+    Parameters
+    ----------
+    auto_start_gateway:
+        When *True*, call :func:`src.gateway.ensure_gateway` before
+        attempting to connect so that IB Gateway is launched via IBC
+        if it is not already running.  Intended for ``-auto`` /
+        cron-job execution.
+
+    Market data type is set to 3 (delayed): live data is returned
+    when a subscription exists, otherwise 15-min delayed data is
+    provided automatically.
     """
+    if auto_start_gateway:
+        from src.gateway import ensure_gateway
+        ensure_gateway()
+
     ib = IB()
     ib.connect(TWS_HOST, TWS_PORT, clientId=TWS_CLIENT_ID)
 
-    # Attach the log filter so ``suppress_errors`` can mute specific
-    # error codes without interfering with the request lifecycle.
     _IB_LOGGER.addFilter(_error_filter)
 
     # Type 3: live if subscribed, delayed otherwise.
@@ -100,6 +110,6 @@ def connect() -> IB:
 
     accounts = ib.managedAccounts()
     if not accounts:
-        raise RuntimeError("No managed accounts returned by TWS.")
-    print(f"Connected to TWS (account: {accounts[0]})\n")
+        raise RuntimeError("No managed accounts returned by IBKR.")
+    print(f"Connected to IBKR (account: {accounts[0]})\n")
     return ib
