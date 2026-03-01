@@ -20,7 +20,10 @@ import urllib.request
 import pandas as pd
 from ib_async import IB, Contract, Forex
 
-from src.config import LIMIT_PRICE_OFFSET, OUTPUT_DIR, PROJECT_PORTFOLIO_COLUMNS
+from src.config import (
+    LIMIT_PRICE_OFFSET, MINIMUM_CASH_RESERVE, OUTPUT_DIR,
+    PROJECT_PORTFOLIO_COLUMNS,
+)
 from src.connection import ensure_connected, suppress_errors
 
 
@@ -527,11 +530,12 @@ def resolve_currencies(ib: IB, df: pd.DataFrame,
 # Public API
 # ==================================================================
 
-def fetch_net_liquidation(ib: IB) -> float:
-    """Fetch the account net liquidation value in USD from IBKR.
+def get_investable_amount(ib: IB) -> float:
+    """Fetch net liquidation from IBKR, subtract the cash reserve, and
+    return the investable amount (USD).
 
-    Uses ``ib.accountSummary()`` and looks for the ``NetLiquidation``
-    tag with ``USD`` currency.
+    Prints the net liquidation, cash reserve (if non-zero), and
+    investable amount.
 
     Raises
     ------
@@ -539,15 +543,25 @@ def fetch_net_liquidation(ib: IB) -> float:
         If the net liquidation value cannot be found.
     """
     summary = ib.accountSummary()
+    net_liq: float | None = None
     for item in summary:
         if item.tag == "NetLiquidation" and item.currency == "USD":
             val = float(item.value)
             if val > 0:
-                return val
-    raise RuntimeError(
-        "Could not retrieve NetLiquidation (USD) from account summary. "
-        "Make sure TWS is connected and has account data loaded."
-    )
+                net_liq = val
+                break
+    if net_liq is None:
+        raise RuntimeError(
+            "Could not retrieve NetLiquidation (USD) from account summary. "
+            "Make sure TWS is connected and has account data loaded."
+        )
+
+    investable = net_liq - MINIMUM_CASH_RESERVE
+    print(f"Net Liquidation (USD): ${net_liq:,.2f}")
+    if MINIMUM_CASH_RESERVE:
+        print(f"Cash Reserve          : ${MINIMUM_CASH_RESERVE:,.2f}")
+    print(f"Investable Amount     : ${investable:,.2f}\n")
+    return investable
 
 
 def fetch_market_data(ib: IB, df: pd.DataFrame) -> pd.DataFrame:

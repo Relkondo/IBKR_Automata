@@ -21,6 +21,10 @@ OUTPUT_DIR = os.path.join(PROJECT_ROOT, "output")
 MINIMUM_TRADING_AMOUNT = 100      # USD – net orders below this value are skipped
 MAXIMUM_AMOUNT_AUTOMATIC_ORDER = 1500  # USD – auto-confirmed orders above this require explicit approval
 
+# Subtracted from net liquidation before computing dollar allocations.
+# Set to 0 to invest the full portfolio; set to e.g. 5000 to keep $5k in cash.
+MINIMUM_CASH_RESERVE = 0
+
 # When rebalancing an existing position, a high stock price can make
 # the actual order (rounded to whole shares) much larger than the
 # projected change from the portfolio model.  If the ratio

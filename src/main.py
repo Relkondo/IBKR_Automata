@@ -44,7 +44,7 @@ from src.connection import connect
 from src.portfolio import load_portfolio
 from src.contracts import resolve_conids
 from src.market_data import (
-    fetch_market_data, fetch_net_liquidation, resolve_currencies,
+    fetch_market_data, get_investable_amount, resolve_currencies,
     save_project_portfolio,
 )
 from src.comparison import generate_project_vs_current
@@ -152,9 +152,8 @@ def main() -> None:
             df = _load_project_portfolio()
 
             # Recompute Dollar Allocation from current net liquidation.
-            net_liq = fetch_net_liquidation(ib)
-            print(f"Net Liquidation (USD): ${net_liq:,.2f}\n")
-            df["Dollar Allocation"] = (df["Basket Allocation"] / 100 * net_liq).round(2)
+            investable = get_investable_amount(ib)
+            df["Dollar Allocation"] = (df["Basket Allocation"] / 100 * investable).round(2)
 
             # Resolve currencies & exchange rates.
             df = resolve_currencies(ib, df, auto_mode=auto_mode)
@@ -173,9 +172,8 @@ def main() -> None:
             df = load_portfolio()
 
             # 2b. Fetch net liquidation and compute Dollar Allocation.
-            net_liq = fetch_net_liquidation(ib)
-            print(f"Net Liquidation (USD): ${net_liq:,.2f}\n")
-            df["Dollar Allocation"] = (df["Basket Allocation"] / 100 * net_liq).round(2)
+            investable = get_investable_amount(ib)
+            df["Dollar Allocation"] = (df["Basket Allocation"] / 100 * investable).round(2)
 
             # 3. Resolve conids.
             print("Resolving contract IDs ...\n")
