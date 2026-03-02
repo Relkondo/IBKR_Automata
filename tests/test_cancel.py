@@ -148,17 +148,77 @@ class TestResolveCancelDecision:
 
 
 class TestExecuteCancel:
+    def _setup_error_event(self, mock_ib):
+        """Wire up mock errorEvent so += captures the handler and sleep
+        can fire it.  Returns a list that collects registered handlers."""
+        handlers: list = []
+
+        def on_add(handler):
+            handlers.append(handler)
+            return mock_ib.errorEvent
+        mock_ib.errorEvent.__iadd__ = MagicMock(side_effect=on_add)
+        return handlers
+
     def test_successful_cancel(self, mock_ib):
+        self._setup_error_event(mock_ib)
         order = MagicMock()
         assert execute_cancel(mock_ib, order) is True
         mock_ib.cancelOrder.assert_called_once_with(order)
 
-    def test_failed_cancel(self, mock_ib):
+    def test_failed_cancel_exception(self, mock_ib):
+        self._setup_error_event(mock_ib)
         mock_ib.cancelOrder.side_effect = Exception("cancel failed")
         order = MagicMock()
         assert execute_cancel(mock_ib, order) is False
 
     def test_already_cancelled_order(self, mock_ib):
-        """Error 202 (already cancelled) is suppressed — should still return True."""
+        """Error 202 (already cancelled) is treated as success."""
+        handlers = self._setup_error_event(mock_ib)
+
+        def fire_202(*_args, **_kwargs):
+            for h in handlers:
+                h(0, 202, "Order Cancelled", None)
+        mock_ib.sleep.side_effect = fire_202
+
         order = MagicMock()
         assert execute_cancel(mock_ib, order) is True
+
+    def test_error_10147_order_not_found(self, mock_ib):
+        """Error 10147 (order not found) must return False so the order
+        stays in the pending count and no duplicate is placed."""
+        handlers = self._setup_error_event(mock_ib)
+
+        def fire_10147(*_args, **_kwargs):
+            for h in handlers:
+                h(0, 10147,
+                  "OrderId 0 that needs to be cancelled is not found.",
+                  None)
+        mock_ib.sleep.side_effect = fire_10147
+
+        order = MagicMock()
+        assert execute_cancel(mock_ib, order) is False
+
+    def test_any_non_202_error_returns_false(self, mock_ib):
+        """Any error code other than 202 should cause a failure return."""
+        handlers = self._setup_error_event(mock_ib)
+
+        def fire_error(*_args, **_kwargs):
+            for h in handlers:
+                h(0, 999, "Some unexpected error", None)
+        mock_ib.sleep.side_effect = fire_error
+
+        order = MagicMock()
+        assert execute_cancel(mock_ib, order) is False
+
+    def test_handler_cleaned_up_on_success(self, mock_ib):
+        """errorEvent -= is always called (via finally) even on success."""
+        self._setup_error_event(mock_ib)
+        execute_cancel(mock_ib, MagicMock())
+        mock_ib.errorEvent.__isub__.assert_called_once()
+
+    def test_handler_cleaned_up_on_exception(self, mock_ib):
+        """errorEvent -= is always called (via finally) even on exception."""
+        self._setup_error_event(mock_ib)
+        mock_ib.cancelOrder.side_effect = Exception("boom")
+        execute_cancel(mock_ib, MagicMock())
+        mock_ib.errorEvent.__isub__.assert_called_once()

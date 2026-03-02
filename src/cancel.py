@@ -126,14 +126,29 @@ def execute_cancel(ib: IB, order_obj) -> bool:
     """Cancel an order via ``ib.cancelOrder()``.
 
     Suppresses error 202 (order already cancelled) and waits briefly
-    for TWS acknowledgement.
+    for TWS acknowledgement.  Captures error events fired during the
+    cancel to detect silent failures (e.g. error 10147 — order not
+    found).
 
     Returns ``True`` on success, ``False`` on failure.
     """
+    captured_codes: list[int] = []
+
+    def _on_error(reqId, errorCode, errorString, contract):
+        captured_codes.append(errorCode)
+
+    ib.errorEvent += _on_error
     try:
         with suppress_errors(202):
             ib.cancelOrder(order_obj)
             ib.sleep(0.3)
-        return True
     except Exception:
         return False
+    finally:
+        ib.errorEvent -= _on_error
+
+    # Error 202 = "Order Cancelled" (TWS confirmation of success).
+    # Any other error code means the cancellation actually failed.
+    if any(code != 202 for code in captured_codes):
+        return False
+    return True

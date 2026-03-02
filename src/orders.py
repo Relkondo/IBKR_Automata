@@ -57,6 +57,7 @@ class _OrderParams:
     net_qty_raw: float | None  # pandas scalar: set by reconciliation, NaN/None otherwise
     mic_str: str
     is_option: bool
+    supports_rel: bool
 
 
 # ==================================================================
@@ -186,15 +187,27 @@ def _compute_usd_amount(limit_price: float, quantity: int,
 def _format_order_details(p: _OrderParams) -> str:
     """Build the human-readable order summary shown before each prompt."""
     local_amount = round(p.limit_price * p.quantity * p.multiplier, 2)
+    if p.supports_rel:
+        type_label = "REL (Relative)"
+        price_label = "Limit Price (cap)"
+    else:
+        type_label = "LMT (Limit)"
+        price_label = "Limit Price"
+
     lines = [
         f"\n{p.idx_label} {p.name} ({p.ticker})"
         + (" (OPTION)" if p.is_option else ""),
-        f"  Order Type        : REL (Relative)",
+        f"  Order Type        : {type_label}",
         f"  Side              : {p.side}",
         f"  Exchange          : {p.mic_str or '?'}",
         f"  Currency          : {p.ccy_label}",
-        f"  Limit Price (cap) : {p.limit_price:,.2f} {p.ccy_label}",
-        f"  Price Offset      : {PRICE_OFFSET}%",
+        f"  {price_label:20s}: {p.limit_price:,.2f} {p.ccy_label}",
+    ]
+
+    if p.supports_rel:
+        lines.append(f"  Price Offset      : {PRICE_OFFSET}%")
+
+    lines += [
         f"  Quantity          : {p.quantity}",
         f"  Amount (at limit) : {local_amount:,.2f} {p.ccy_label}",
     ]
@@ -372,14 +385,23 @@ def _place_single_order(
             elif choice == "E":
                 state.confirm_exchanges.add(p.mic_str)
 
-            order = Order(
-                orderType='REL',
-                action=p.side,
-                totalQuantity=p.quantity,
-                lmtPrice=p.limit_price,
-                percentOffset=PRICE_OFFSET / 100,
-                tif='DAY',
-            )
+            if p.supports_rel:
+                order = Order(
+                    orderType='REL',
+                    action=p.side,
+                    totalQuantity=p.quantity,
+                    lmtPrice=p.limit_price,
+                    percentOffset=PRICE_OFFSET / 100,
+                    tif='DAY',
+                )
+            else:
+                order = Order(
+                    orderType='LMT',
+                    action=p.side,
+                    totalQuantity=p.quantity,
+                    lmtPrice=p.limit_price,
+                    tif='DAY',
+                )
 
             try:
                 trade, error_reason = _place_order(
@@ -565,10 +587,14 @@ def _prepare_order_params(
 
     # --- Qualify the contract -----------------------------------------
     order_contract = Contract(conId=conid)
+    supports_rel = True
     try:
         details = ib.reqContractDetails(order_contract)
         if details:
             order_contract = details[0].contract
+            order_types = getattr(details[0], "orderTypes", "") or ""
+            if order_types:
+                supports_rel = "REL" in order_types.split(",")
     except Exception:
         pass
 
@@ -590,6 +616,7 @@ def _prepare_order_params(
         net_qty_raw=net_qty_raw,
         mic_str=mic_str,
         is_option=is_option,
+        supports_rel=supports_rel,
     )
 
 

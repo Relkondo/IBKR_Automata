@@ -184,6 +184,34 @@ class TestPrepareOrderParams:
         assert params.multiplier == 100
         assert params.is_option is True
 
+    def test_supports_rel_from_contract_details(self, mock_ib):
+        """REL in orderTypes → supports_rel=True."""
+        cd = MockContractDetails(contract=MockContract(conId=265598))
+        cd.orderTypes = "LMT,MKT,REL,STP"
+        mock_ib.reqContractDetails.return_value = [cd]
+        row = self._make_row()
+        params = _prepare_order_params(mock_ib, row, 0, 10, _AutoState())
+        assert params is not None
+        assert params.supports_rel is True
+
+    def test_no_rel_in_order_types(self, mock_ib):
+        """REL not in orderTypes → supports_rel=False."""
+        cd = MockContractDetails(contract=MockContract(conId=265598))
+        cd.orderTypes = "LMT,MKT,STP"
+        mock_ib.reqContractDetails.return_value = [cd]
+        row = self._make_row()
+        params = _prepare_order_params(mock_ib, row, 0, 10, _AutoState())
+        assert params is not None
+        assert params.supports_rel is False
+
+    def test_empty_contract_details_defaults_rel(self, mock_ib):
+        """No contract details → supports_rel=True (optimistic default)."""
+        mock_ib.reqContractDetails.return_value = []
+        row = self._make_row()
+        params = _prepare_order_params(mock_ib, row, 0, 10, _AutoState())
+        assert params is not None
+        assert params.supports_rel is True
+
 
 # ── _format_order_details ──────────────────────────────────────────
 
@@ -200,6 +228,7 @@ class TestFormatOrderDetails:
             side="BUY", multiplier=1, ccy_label="USD",
             is_foreign=False, fx=1.0, dollar_alloc=5000.0,
             net_qty_raw=None, mic_str="XNAS", is_option=False,
+            supports_rel=True,
         )
         output = _format_order_details(p)
         assert "APPLE INC" in output
@@ -217,6 +246,7 @@ class TestFormatOrderDetails:
             side="BUY", multiplier=1, ccy_label="USD",
             is_foreign=False, fx=1.0, dollar_alloc=5000.0,
             net_qty_raw=18, mic_str="XNAS", is_option=False,
+            supports_rel=True,
         )
         output = _format_order_details(p)
         assert "reconciliation" in output
@@ -231,6 +261,7 @@ class TestFormatOrderDetails:
             side="BUY", multiplier=1, ccy_label="JPY",
             is_foreign=True, fx=150.0, dollar_alloc=500.0,
             net_qty_raw=None, mic_str="XFRA", is_option=False,
+            supports_rel=True,
         )
         output = _format_order_details(p)
         assert "JPY" in output
@@ -245,9 +276,40 @@ class TestFormatOrderDetails:
             side="BUY", multiplier=100, ccy_label="USD",
             is_foreign=False, fx=1.0, dollar_alloc=1000.0,
             net_qty_raw=None, mic_str="XNAS", is_option=True,
+            supports_rel=True,
         )
         output = _format_order_details(p)
         assert "(OPTION)" in output
+
+    def test_rel_order_display(self):
+        row = pd.Series({})
+        p = _OrderParams(
+            row=row, order_contract=MockContract(),
+            idx_label="[1/1]", name="AAPL", ticker="AAPL",
+            conid=1, limit_price=178.50, quantity=10,
+            side="BUY", multiplier=1, ccy_label="USD",
+            is_foreign=False, fx=1.0, dollar_alloc=1785.0,
+            net_qty_raw=None, mic_str="XNAS", is_option=False,
+            supports_rel=True,
+        )
+        output = _format_order_details(p)
+        assert "REL (Relative)" in output
+        assert "Price Offset" in output
+
+    def test_lmt_fallback_display(self):
+        row = pd.Series({})
+        p = _OrderParams(
+            row=row, order_contract=MockContract(),
+            idx_label="[1/1]", name="AAPL", ticker="AAPL",
+            conid=1, limit_price=178.50, quantity=10,
+            side="BUY", multiplier=1, ccy_label="USD",
+            is_foreign=False, fx=1.0, dollar_alloc=1785.0,
+            net_qty_raw=None, mic_str="XFRA", is_option=False,
+            supports_rel=False,
+        )
+        output = _format_order_details(p)
+        assert "LMT (Limit)" in output
+        assert "Price Offset" not in output
 
 
 # ── _order_summary ─────────────────────────────────────────────────
@@ -263,6 +325,7 @@ class TestOrderSummary:
             side="BUY", multiplier=1, ccy_label="USD",
             is_foreign=False, fx=1.0, dollar_alloc=5000.0,
             net_qty_raw=None, mic_str="XNAS", is_option=False,
+            supports_rel=True,
         )
         summary = _order_summary(p, reason="test")
         assert summary["ticker"] == "AAPL"
@@ -443,6 +506,7 @@ class TestHandleTickError:
             side="BUY", multiplier=1, ccy_label="USD",
             is_foreign=False, fx=1.0, dollar_alloc=1000.0,
             net_qty_raw=None, mic_str="XNAS", is_option=False,
+            supports_rel=True,
         )
         defaults.update(overrides)
         return _OrderParams(**defaults)
@@ -499,6 +563,7 @@ class TestPromptModify:
             side="BUY", multiplier=1, ccy_label="USD",
             is_foreign=False, fx=1.0, dollar_alloc=1000.0,
             net_qty_raw=None, mic_str="XNAS", is_option=False,
+            supports_rel=True,
         )
 
     def test_modify_quantity(self):
@@ -570,6 +635,7 @@ class TestPlaceSingleOrder:
             side="BUY", multiplier=1, ccy_label="USD",
             is_foreign=False, fx=1.0, dollar_alloc=500.0,
             net_qty_raw=3, mic_str="XNAS", is_option=False,
+            supports_rel=True,
         )
         defaults.update(overrides)
         return _OrderParams(**defaults)
@@ -758,6 +824,28 @@ class TestPlaceSingleOrder:
         with patch("builtins.input", side_effect=["Y", "R", "Y"]):
             _place_single_order(mock_ib, p, placed, _AutoState())
         assert len(placed) == 1
+
+    def test_lmt_order_when_rel_not_supported(self, mock_ib):
+        """When supports_rel=False, a LMT order is placed (no percentOffset)."""
+        self._mock_successful_trade(mock_ib)
+        p = self._make_params(supports_rel=False)
+        placed = []
+        with patch("builtins.input", return_value="Y"):
+            _place_single_order(mock_ib, p, placed, _AutoState())
+        assert len(placed) == 1
+        order_arg = mock_ib.placeOrder.call_args[0][1]
+        assert order_arg.orderType == "LMT"
+
+    def test_rel_order_when_supported(self, mock_ib):
+        """When supports_rel=True, a REL order is placed with percentOffset."""
+        self._mock_successful_trade(mock_ib)
+        p = self._make_params(supports_rel=True)
+        placed = []
+        with patch("builtins.input", return_value="Y"):
+            _place_single_order(mock_ib, p, placed, _AutoState())
+        assert len(placed) == 1
+        order_arg = mock_ib.placeOrder.call_args[0][1]
+        assert order_arg.orderType == "REL"
 
     def test_tick_error_retries_with_adjusted_price(self, mock_ib):
         """Error 110 in trade.log triggers tick-size retry."""
