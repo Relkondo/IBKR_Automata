@@ -182,6 +182,7 @@ def enriched_portfolio_df():
         "day_low": [174.0, 419.0],
         "market_rule_ids": ["26,240", "26,240"],
         "limit_price": [178.50, 428.40],
+        "price_source": ["bid", "bid"],
         "Qty": [28, 7],
         "Actual Dollar Allocation": [4998.0, 2998.8],
     })

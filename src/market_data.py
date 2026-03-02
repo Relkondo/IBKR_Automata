@@ -245,7 +245,9 @@ def _snap_limit_price(row, ib: IB) -> float | None:
 # Limit-price calculation
 # ==================================================================
 
-def calc_limit_price(row, *, is_sell: bool | None = None) -> float | None:
+def calc_limit_price(
+    row, *, is_sell: bool | None = None,
+) -> tuple[float | None, str | None]:
     """Compute the cap/floor limit price for a Relative (REL) order.
 
     Uses ``LIMIT_PRICE_OFFSET`` (a percentage of the reference price):
@@ -262,6 +264,13 @@ def calc_limit_price(row, *, is_sell: bool | None = None) -> float | None:
     is_sell : bool | None
         Override buy/sell determination.  When ``None`` (default), the
         direction is inferred from the row's ``Dollar Allocation``.
+
+    Returns
+    -------
+    (limit_price, price_source)
+        The computed limit price (or ``None``) and the name of the
+        market-data field used as reference (``"bid"``, ``"ask"``,
+        ``"last"``, ``"close"``, or ``None``).
     """
     bid = row.get("bid")
     ask = row.get("ask")
@@ -277,25 +286,25 @@ def calc_limit_price(row, *, is_sell: bool | None = None) -> float | None:
 
     # Primary: use bid (buy) or ask (sell) as reference.
     if is_sell and pd.notna(ask) and float(ask) > 0:
-        return round(float(ask) * multiplier, 2)
+        return round(float(ask) * multiplier, 2), "ask"
     if not is_sell and pd.notna(bid) and float(bid) > 0:
-        return round(float(bid) * multiplier, 2)
+        return round(float(bid) * multiplier, 2), "bid"
 
     # Fallback 1: last traded price.
     if pd.notna(last) and float(last) > 0:
-        return round(float(last) * multiplier, 2)
+        return round(float(last) * multiplier, 2), "last"
 
     # Fallback 2: close price.
     if pd.notna(close) and float(close) > 0:
-        return round(float(close) * multiplier, 2)
+        return round(float(close) * multiplier, 2), "close"
 
     # Fallback 3: any available price (no offset applied).
     if pd.notna(bid) and float(bid) > 0:
-        return round(float(bid), 2)
+        return round(float(bid), 2), "bid"
     if pd.notna(ask) and float(ask) > 0:
-        return round(float(ask), 2)
+        return round(float(ask), 2), "ask"
 
-    return None
+    return None, None
 
 
 # ==================================================================
@@ -637,7 +646,9 @@ def fetch_market_data(ib: IB, df: pd.DataFrame) -> pd.DataFrame:
     df["day_low"] = lows
 
     # 5. Compute limit prices and snap to valid tick increments.
-    df["limit_price"] = df.apply(calc_limit_price, axis=1)
+    price_pairs = df.apply(calc_limit_price, axis=1, result_type="expand")
+    df["limit_price"] = price_pairs[0]
+    df["price_source"] = price_pairs[1]
     df["limit_price"] = df.apply(_snap_limit_price, axis=1, ib=ib)
 
     # 6. Compute planned quantities and actual dollar allocations.

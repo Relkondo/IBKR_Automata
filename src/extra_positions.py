@@ -317,7 +317,7 @@ def _build_extra_rows(
 
         # Compute limit price using the shared spread-based formula.
         is_sell = existing > 0
-        limit_price = calc_limit_price(row_dict, is_sell=is_sell)
+        limit_price, lp_source = calc_limit_price(row_dict, is_sell=is_sell)
 
         # Snap limit price to valid tick increment.
         if limit_price is not None and ei.market_rules:
@@ -328,6 +328,7 @@ def _build_extra_rows(
             )
 
         row_dict["limit_price"] = limit_price
+        row_dict["price_source"] = lp_source
         row_dict["market_rule_ids"] = ei.market_rules
         row_dict["net_quantity"] = compute_net_quantity(
             target=0, existing=existing, pending=pending,

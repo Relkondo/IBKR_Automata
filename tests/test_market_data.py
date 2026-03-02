@@ -173,61 +173,74 @@ class TestCalcLimitPrice:
     def test_buy_uses_bid_with_offset(self):
         row = {"bid": 100.0, "ask": 101.0, "last": 100.5,
                "close": 99.0, "Dollar Allocation": 5000.0}
-        price = calc_limit_price(row)
+        price, source = calc_limit_price(row)
         assert price == round(100.0 * 1.02, 2)  # LIMIT_PRICE_OFFSET=2
+        assert source == "bid"
 
     def test_sell_uses_ask_with_offset(self):
         row = {"bid": 100.0, "ask": 101.0, "last": 100.5,
                "close": 99.0, "Dollar Allocation": -5000.0}
-        price = calc_limit_price(row)
+        price, source = calc_limit_price(row)
         assert price == round(101.0 * 0.98, 2)
+        assert source == "ask"
 
     def test_explicit_is_sell(self):
         row = {"bid": 100.0, "ask": 101.0, "last": 100.5,
                "close": 99.0, "Dollar Allocation": 5000.0}
-        price = calc_limit_price(row, is_sell=True)
+        price, source = calc_limit_price(row, is_sell=True)
         assert price == round(101.0 * 0.98, 2)
+        assert source == "ask"
 
     def test_fallback_to_last(self):
         row = {"bid": None, "ask": None, "last": 100.0,
                "close": 99.0, "Dollar Allocation": 5000.0}
-        price = calc_limit_price(row)
+        price, source = calc_limit_price(row)
         assert price == round(100.0 * 1.02, 2)
+        assert source == "last"
 
     def test_fallback_to_close(self):
         row = {"bid": None, "ask": None, "last": None,
                "close": 99.0, "Dollar Allocation": 5000.0}
-        price = calc_limit_price(row)
+        price, source = calc_limit_price(row)
         assert price == round(99.0 * 1.02, 2)
+        assert source == "close"
 
     def test_fallback_to_any_price_no_offset(self):
         row = {"bid": 100.0, "ask": None, "last": None,
                "close": None, "Dollar Allocation": -5000.0}
-        price = calc_limit_price(row)
+        price, source = calc_limit_price(row)
         assert price == 100.0  # bid available but we're selling → fallback 3
+        assert source == "bid"
 
     def test_all_prices_missing(self):
         row = {"bid": None, "ask": None, "last": None,
                "close": None, "Dollar Allocation": 5000.0}
-        assert calc_limit_price(row) is None
+        price, source = calc_limit_price(row)
+        assert price is None
+        assert source is None
 
     def test_all_prices_zero(self):
         row = {"bid": 0.0, "ask": 0.0, "last": 0.0,
                "close": 0.0, "Dollar Allocation": 5000.0}
-        assert calc_limit_price(row) is None
+        price, source = calc_limit_price(row)
+        assert price is None
+        assert source is None
 
     def test_nan_prices_treated_as_missing(self):
         row = {"bid": float("nan"), "ask": float("nan"),
                "last": float("nan"), "close": float("nan"),
                "Dollar Allocation": 5000.0}
-        assert calc_limit_price(row) is None
+        price, source = calc_limit_price(row)
+        assert price is None
+        assert source is None
 
     def test_no_dollar_allocation_defaults_to_buy(self):
         row = {"bid": 100.0, "ask": 101.0, "last": 100.5,
                "close": 99.0, "Dollar Allocation": None}
-        price = calc_limit_price(row)
+        price, source = calc_limit_price(row)
         # is_sell = False when Dollar Allocation is None/NaN
         assert price == round(100.0 * 1.02, 2)
+        assert source == "bid"
 
 
 # ── get_fx ─────────────────────────────────────────────────────────

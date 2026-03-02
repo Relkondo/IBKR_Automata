@@ -84,6 +84,9 @@ class TestGenerateProjectVsCurrent:
         assert "IBKR Name" in loaded.columns
         assert "Current Dollar Allocation" in loaded.columns
         assert "Project VS Current" in loaded.columns
+        assert "Limit Price" in loaded.columns
+        assert "Price Source" in loaded.columns
+        assert "Last Price" not in loaded.columns
         assert len(loaded) == 2
 
     def test_handles_empty_portfolio(self, mock_ib, reconciled_df, tmp_path):

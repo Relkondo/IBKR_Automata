@@ -129,11 +129,21 @@ def _get_calendar(mic: str) -> xcals.ExchangeCalendar | None:
 
 
 def _is_holiday(mic: str) -> bool:
-    """Return True if today is a holiday for *mic*'s exchange."""
+    """Return True if today is a holiday for *mic*'s exchange.
+
+    Uses the current date **in the exchange's own timezone** so that
+    cross-timezone differences (e.g. Sunday in the US but Monday in
+    Asia) don't produce false positives.
+    """
     cal = _get_calendar(mic)
     if cal is None:
         return False
-    today = date.today()
+    entry = EXCHANGE_HOURS.get(mic)
+    if entry is not None:
+        tz = ZoneInfo(entry[0])
+        today = datetime.now(tz).date()
+    else:
+        today = date.today()
     try:
         return not cal.is_session(today)
     except ValueError:

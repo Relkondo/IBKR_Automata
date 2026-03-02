@@ -131,6 +131,7 @@ PROJECT_PORTFOLIO_COLUMNS = [
     "day_low",
     "market_rule_ids",
     "limit_price",
+    "price_source",
     "Qty",
     "Actual Dollar Allocation",
 ]

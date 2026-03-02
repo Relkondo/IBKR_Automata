@@ -96,6 +96,28 @@ class TestIsHoliday:
     def test_unknown_exchange_not_holiday(self):
         assert _is_holiday("ZZZZ") is False
 
+    def test_uses_exchange_timezone_date(self):
+        """Sunday in the US is Monday in Taipei — XTAI should NOT be a holiday.
+
+        _is_holiday must use the date in the exchange's timezone, not
+        the local machine date.  Without this fix, date.today() would
+        return Sunday, cal.is_session(Sunday) → False, and XTAI would
+        be incorrectly considered closed.
+        """
+        from datetime import date as _date
+        taipei_monday = datetime(2026, 3, 2, 9, 0,
+                                 tzinfo=ZoneInfo("Asia/Taipei"))
+        mock_cal = MagicMock()
+        mock_cal.is_session.return_value = True  # Monday = session
+
+        with patch("src.exchange_hours._get_calendar", return_value=mock_cal), \
+             patch("src.exchange_hours.datetime") as mock_dt:
+            mock_dt.now.return_value = taipei_monday
+            result = _is_holiday("XTAI")
+
+        mock_cal.is_session.assert_called_once_with(_date(2026, 3, 2))
+        assert result is False
+
 
 # ── is_exchange_open ───────────────────────────────────────────────
 
