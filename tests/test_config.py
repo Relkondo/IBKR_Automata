@@ -3,7 +3,7 @@
 import os
 
 from src.config import (
-    TWS_HOST, TWS_PORT, GATEWAY_PORT, TWS_CLIENT_ID,
+    TWS_HOST, TWS_PORT, GATEWAY_PORT,
     PROJECT_ROOT, INPUT_DIR, OUTPUT_DIR,
     MINIMUM_TRADING_AMOUNT, MAXIMUM_AMOUNT_AUTOMATIC_ORDER,
     MINIMUM_CASH_RESERVE, SELL_REBALANCE_RATIO_LIMIT,
@@ -25,9 +25,6 @@ class TestConfigValues:
     def test_gateway_port_is_int(self):
         assert isinstance(GATEWAY_PORT, int)
         assert GATEWAY_PORT > 0
-
-    def test_tws_client_id_is_int(self):
-        assert isinstance(TWS_CLIENT_ID, int)
 
     def test_project_root_contains_src(self):
         assert os.path.isdir(os.path.join(PROJECT_ROOT, "src"))

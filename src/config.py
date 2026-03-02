@@ -12,7 +12,6 @@ load_dotenv()
 #   Gateway: 4001 (live), 4002 (paper)
 #   TWS:     7496 (live), 7497 (paper)
 TWS_HOST = os.getenv("IBKR_HOST", "127.0.0.1")
-TWS_CLIENT_ID = int(os.getenv("IBKR_CLIENT_ID", "1"))
 
 # --- IB Gateway / IBC settings (used by src/gateway.py) ---
 IBC_PATH = os.path.expanduser(os.getenv("IBC_PATH", "/opt/ibc"))

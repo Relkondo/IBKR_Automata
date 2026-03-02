@@ -43,7 +43,6 @@ Connection settings are read from environment variables (`.env` file or shell). 
 | `IBKR_HOST` | `127.0.0.1` | IBKR API host. |
 | `IBKR_TWS_PORT` | `7497` (paper) / `7496` (live) | TWS port for interactive runs. Derived from `TRADING_MODE`. |
 | `IBKR_GATEWAY_PORT` | `4002` (paper) / `4001` (live) | IB Gateway port for `-auto` / cron runs. Derived from `TRADING_MODE`. |
-| `IBKR_CLIENT_ID` | `1` | Client ID for the API connection. |
 
 Trading thresholds (in `src/config.py`):
 
@@ -250,8 +249,8 @@ TRADING_MODE=live       # or paper
 TWS_MAJOR_VRSN=10.44   # check via Help > About in TWS, or tail ~/Jts/launcher.log
 # Ports are derived from TRADING_MODE automatically.
 # Override only if your setup uses non-standard ports:
-# IBKR_GATEWAY_PORT=4001
-# IBKR_TWS_PORT=7496
+IBKR_GATEWAY_PORT=4001
+IBKR_TWS_PORT=7496
 ```
 
 ### 5. Set up the cron job
