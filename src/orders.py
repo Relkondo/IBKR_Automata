@@ -102,6 +102,13 @@ def cancel_all_orders(ib: IB,
         remaining = o.totalQuantity
         price = o.lmtPrice if hasattr(o, "lmtPrice") else ""
 
+        if not oid:
+            order_desc = f"{side} {remaining} {ticker} @ {price}"
+            print(f"  Skipped order {oid}  {order_desc}  "
+                  f"(not cancellable — belongs to another client)")
+            skipped += 1
+            continue
+
         # Determine MIC and exchange-open status.
         raw_exchange = c.primaryExchange or c.exchange or ""
         mic = exchange_to_mic(raw_exchange) if raw_exchange else ""

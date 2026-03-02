@@ -13,7 +13,7 @@ from contextlib import contextmanager
 
 from ib_async import IB
 
-from src.config import TWS_HOST, TWS_PORT, TWS_CLIENT_ID
+from src.config import TWS_HOST, TWS_PORT, GATEWAY_PORT, TWS_CLIENT_ID
 
 # ==================================================================
 # Error-code suppression
@@ -100,8 +100,9 @@ def connect(*, auto_start_gateway: bool = False) -> IB:
         from src.gateway import ensure_gateway
         ensure_gateway()
 
+    port = GATEWAY_PORT if auto_start_gateway else TWS_PORT
     ib = IB()
-    ib.connect(TWS_HOST, TWS_PORT, clientId=TWS_CLIENT_ID)
+    ib.connect(TWS_HOST, port, clientId=TWS_CLIENT_ID)
 
     _IB_LOGGER.addFilter(_error_filter)
 
@@ -116,8 +117,16 @@ def connect(*, auto_start_gateway: bool = False) -> IB:
     # request is made.  The startup fetch may return empty because the
     # data-farm link isn't established yet.  Force a fresh sync so
     # downstream code never sees stale/empty caches.
+    #
+    # reqAutoOpenOrders(True) binds TWS-placed orders to this client
+    # (effective only with clientId 0).  reqOpenOrders() then fetches
+    # orders owned by / bound to this client — with valid orderIds
+    # that can actually be cancelled.  Avoid reqAllOpenOrders() which
+    # returns cross-client orders with orderId=0 that are visible but
+    # uncancellable, causing silent failures downstream.
     ib.reqPositions()
-    ib.reqAllOpenOrders()
+    ib.reqAutoOpenOrders(True)
+    ib.reqOpenOrders()
     ib.reqAccountSummary()
     ib.sleep(2)
 

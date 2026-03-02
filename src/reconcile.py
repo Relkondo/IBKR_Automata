@@ -68,10 +68,18 @@ def _fetch_open_orders(ib: IB) -> list[dict]:
     """Return open orders as normalised dicts.
 
     Each dict has: ``conid``, ``orderId``, ``side``, ``price``,
-    ``remainingQuantity``, ``status``, ``trade`` (the Trade object).
+    ``remainingQuantity``, ``status``, ``trade`` (the Trade object),
+    and ``cancellable`` (bool).
+
+    Orders with ``orderId == 0`` originate from another client (e.g.
+    TWS GUI) and were fetched by ``reqAllOpenOrders``.  They are
+    included so their quantity counts as pending, but marked
+    ``cancellable=False`` because IBKR cannot cancel them via this
+    API connection.
     """
     trades = ib.openTrades()
     orders: list[dict] = []
+    unmanageable = 0
     for trade in trades:
         c = trade.contract
         o = trade.order
@@ -87,20 +95,32 @@ def _fetch_open_orders(ib: IB) -> list[dict]:
             side = "SELL"
 
         cid = c.conId
-        if cid:
-            orders.append({
-                "conid": cid,
-                "orderId": o.orderId,
-                "side": side,
-                "price": o.lmtPrice if hasattr(o, "lmtPrice") else None,
-                "remainingQuantity": float(
-                    trade.orderStatus.remaining
-                    if trade.orderStatus.remaining
-                    else o.totalQuantity
-                ),
-                "status": status,
-                "trade": trade,
-            })
+        if not cid:
+            continue
+
+        cancellable = bool(o.orderId)
+        if not cancellable:
+            unmanageable += 1
+
+        orders.append({
+            "conid": cid,
+            "orderId": o.orderId,
+            "side": side,
+            "price": o.lmtPrice if hasattr(o, "lmtPrice") else None,
+            "remainingQuantity": float(
+                trade.orderStatus.remaining
+                if trade.orderStatus.remaining
+                else o.totalQuantity
+            ),
+            "status": status,
+            "trade": trade,
+            "cancellable": cancellable,
+        })
+
+    if unmanageable:
+        print(f"  ({unmanageable} order(s) from another client — "
+              f"visible but not cancellable from this connection)")
+
     return orders
 
 
@@ -314,6 +334,13 @@ def _cancel_superfluous_orders(
             sq = signed_order_qty(order)
             direction = "BUY" if sq > 0 else "SELL"
 
+            if not order.get("cancellable", True):
+                print(f"  {label} Superfluous {direction} order "
+                      f"{order['orderId']} for '{name}' "
+                      f"— not cancellable (belongs to another client)")
+                to_keep.append(order)
+                continue
+
             if raw_need == 0:
                 reason_detail = "position already on target"
             elif (raw_need > 0 and sq < 0) or (raw_need < 0 and sq > 0):
@@ -416,6 +443,13 @@ def _cancel_stale_orders(
 
         for order in conid_orders:
             if not _is_order_stale(order, limit_price, tol_pct):
+                kept.append(order)
+                continue
+
+            if not order.get("cancellable", True):
+                print(f"  {label} Stale order {order['orderId']} "
+                      f"for '{name}' — not cancellable "
+                      f"(belongs to another client)")
                 kept.append(order)
                 continue
 

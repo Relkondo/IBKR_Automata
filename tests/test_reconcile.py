@@ -68,6 +68,7 @@ class TestFetchOpenOrders:
         assert orders[0]["conid"] == 123
         assert orders[0]["side"] == "BUY"
         assert orders[0]["remainingQuantity"] == 50
+        assert orders[0]["cancellable"] is True
 
     def test_normalizes_side_abbreviations(self, mock_ib):
         c = MockContract(conId=1)
@@ -97,6 +98,20 @@ class TestFetchOpenOrders:
         trade = MockTrade(contract=c, order=o, orderStatus=os_)
         mock_ib.openTrades.return_value = [trade]
         assert _fetch_open_orders(mock_ib) == []
+
+    def test_order_id_zero_marked_not_cancellable(self, mock_ib):
+        """Orders with orderId=0 (from another client) are included
+        but flagged cancellable=False so their qty counts as pending."""
+        c = MockContract(conId=123, symbol="AAPL")
+        o = MockOrder(orderId=0, action="BUY", totalQuantity=10)
+        os_ = MockOrderStatus(status="Submitted", remaining=10)
+        trade = MockTrade(contract=c, order=o, orderStatus=os_)
+        mock_ib.openTrades.return_value = [trade]
+
+        orders = _fetch_open_orders(mock_ib)
+        assert len(orders) == 1
+        assert orders[0]["cancellable"] is False
+        assert orders[0]["remainingQuantity"] == 10
 
 
 # ── _is_order_stale ───────────────────────────────────────────────
@@ -443,6 +458,24 @@ class TestCancelStaleOrders:
         assert counts[0] == 0
         assert len(remaining[265598]) == 1
 
+    def test_uncancellable_order_kept(self, mock_ib):
+        """Stale orders with cancellable=False are kept (not attempted)."""
+        df = self._make_df()
+        orders_by_conid = {265598: [{
+            "orderId": 0, "side": "BUY", "remainingQuantity": 5,
+            "price": 150.0, "trade": MagicMock(), "cancellable": False,
+        }]}
+        state = CancelState(confirm_all=True)
+
+        with patch("src.reconcile.STALE_ORDER_TOL_PCT", 0.001), \
+             patch("src.reconcile.is_exchange_open", return_value=True):
+            remaining, counts = _cancel_stale_orders(
+                mock_ib, df, orders_by_conid, True, state)
+
+        assert counts[0] == 0
+        assert len(remaining[265598]) == 1
+        mock_ib.cancelOrder.assert_not_called()
+
     def test_no_orders_for_conid(self, mock_ib):
         df = self._make_df()
         state = CancelState()
@@ -574,6 +607,24 @@ class TestCancelSuperfluousOrders:
 
         assert counts[0] == 0
         assert len(remaining[265598]) == 1
+
+    def test_uncancellable_superfluous_order_kept(self, mock_ib):
+        """Superfluous orders with cancellable=False are kept."""
+        df = self._make_df(Qty=[10])
+        positions = {265598: 10.0}
+        orders_by_conid = {265598: [{
+            "orderId": 0, "side": "BUY", "remainingQuantity": 5,
+            "price": 178.0, "trade": MagicMock(), "cancellable": False,
+        }]}
+        state = CancelState(confirm_all=True)
+
+        with patch("src.reconcile.is_exchange_open", return_value=True):
+            remaining, counts = _cancel_superfluous_orders(
+                mock_ib, df, orders_by_conid, positions, True, state)
+
+        assert counts[0] == 0
+        assert len(remaining[265598]) == 1
+        mock_ib.cancelOrder.assert_not_called()
 
     def test_no_orders_no_change(self, mock_ib):
         df = self._make_df()

@@ -41,7 +41,8 @@ Connection settings are read from environment variables (`.env` file or shell). 
 | Env var | Default | Description |
 |---|---|---|
 | `IBKR_HOST` | `127.0.0.1` | IBKR API host. |
-| `IBKR_PORT` | `4001` | API port. `4001` = Gateway live, `4002` = Gateway paper, `7496` = TWS live, `7497` = TWS paper. |
+| `IBKR_TWS_PORT` | `7497` (paper) / `7496` (live) | TWS port for interactive runs. Derived from `TRADING_MODE`. |
+| `IBKR_GATEWAY_PORT` | `4002` (paper) / `4001` (live) | IB Gateway port for `-auto` / cron runs. Derived from `TRADING_MODE`. |
 | `IBKR_CLIENT_ID` | `1` | Client ID for the API connection. |
 
 Trading thresholds (in `src/config.py`):
@@ -178,6 +179,8 @@ For fully unattended execution (e.g. via `cron`), IBKR Automata can start **IB G
 
 ### 1. TWS installation (includes Gateway)
 
+You can install either TWS or IB Gateway. TWS has a UI, IB Gateway is lightweight.
+
 A TWS installation already contains the IB Gateway code -- no separate download is needed. IBC can launch Gateway mode directly from the TWS install at `~/Applications/Trader Workstation/`.
 
 If you haven't installed TWS yet, download the **offline** (stable) installer from [Interactive Brokers](https://www.interactivebrokers.com/en/trading/tws.php). On macOS it installs to `~/Applications`.
@@ -243,9 +246,12 @@ AutoRestartTime=11:55 PM
 Add IBC settings to your `.env` file (see `.env.example`):
 
 ```bash
-IBKR_PORT=4001          # or 4002 for paper
 TRADING_MODE=live       # or paper
 TWS_MAJOR_VRSN=10.44   # check via Help > About in TWS, or tail ~/Jts/launcher.log
+# Ports are derived from TRADING_MODE automatically.
+# Override only if your setup uses non-standard ports:
+# IBKR_GATEWAY_PORT=4001
+# IBKR_TWS_PORT=7496
 ```
 
 ### 5. Set up the cron job

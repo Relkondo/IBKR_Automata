@@ -18,13 +18,13 @@ from src.config import (
     GATEWAY_TWS_PATH,
     TWS_MAJOR_VRSN,
     TWS_HOST,
-    TWS_PORT,
+    GATEWAY_PORT,
     TRADING_MODE,
     GATEWAY_STARTUP_TIMEOUT,
 )
 
 
-def is_gateway_running(host: str = TWS_HOST, port: int = TWS_PORT) -> bool:
+def is_gateway_running(host: str = TWS_HOST, port: int = GATEWAY_PORT) -> bool:
     """Return *True* if something is accepting TCP connections on *host*:*port*."""
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.settimeout(2)

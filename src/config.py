@@ -7,11 +7,11 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # --- IBKR connection ---
-# Defaults target IB Gateway live.  Override via .env or shell env vars.
-# Ports: 4001 = Gateway live, 4002 = Gateway paper,
-#        7496 = TWS live,     7497 = TWS paper
+# Two ports are maintained: one for IB Gateway (-auto / cron mode) and
+# one for TWS (interactive mode).  Defaults are derived from TRADING_MODE.
+#   Gateway: 4001 (live), 4002 (paper)
+#   TWS:     7496 (live), 7497 (paper)
 TWS_HOST = os.getenv("IBKR_HOST", "127.0.0.1")
-TWS_PORT = int(os.getenv("IBKR_PORT", "4001"))
 TWS_CLIENT_ID = int(os.getenv("IBKR_CLIENT_ID", "1"))
 
 # --- IB Gateway / IBC settings (used by src/gateway.py) ---
@@ -21,6 +21,11 @@ GATEWAY_TWS_PATH = os.path.expanduser(os.getenv("TWS_PATH", "~/Applications"))
 TWS_MAJOR_VRSN = os.getenv("TWS_MAJOR_VRSN", "10.37")
 TRADING_MODE = os.getenv("TRADING_MODE", "paper")
 GATEWAY_STARTUP_TIMEOUT = int(os.getenv("GATEWAY_STARTUP_TIMEOUT", "120"))
+
+_DEFAULT_GATEWAY_PORT = "4001" if TRADING_MODE == "live" else "4002"
+_DEFAULT_TWS_PORT = "7496" if TRADING_MODE == "live" else "7497"
+GATEWAY_PORT = int(os.getenv("IBKR_GATEWAY_PORT", _DEFAULT_GATEWAY_PORT))
+TWS_PORT = int(os.getenv("IBKR_TWS_PORT", _DEFAULT_TWS_PORT))
 
 # --- Paths ---
 # Resolve relative to the project root (parent of src/)
