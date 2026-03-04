@@ -171,7 +171,7 @@ def main() -> None:
         # ==============================================================
         else:
             # 2. Read portfolio.
-            df = load_portfolio()
+            df = load_portfolio(auto_mode=auto_mode)
 
             # 2b. Fetch net liquidation and compute Dollar Allocation.
             investable = get_investable_amount(ib)

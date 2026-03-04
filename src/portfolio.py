@@ -11,12 +11,16 @@ the basket allocation by the account net liquidation value.
 
 import os
 import re
+import sys
+import time
+from datetime import datetime, timedelta
 
 import pandas as pd
 
 from src.config import (
     INPUT_DIR, IGNORE_NAMES,
     OPTION_TICKER_REDIRECTS, STOCK_TICKER_REDIRECTS,
+    INPUT_SHEET_MAX_AGE_HOURS,
 )
 
 # Columns we need from the Excel file (header row names).
@@ -188,7 +192,32 @@ def _apply_ticker_redirects(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def load_portfolio(xlsx_path: str | None = None) -> pd.DataFrame:
+def _check_sheet_freshness(path: str, *, auto_mode: bool) -> None:
+    """Abort or warn if the input sheet is older than the configured limit."""
+    mtime = os.path.getmtime(path)
+    age_hours = (time.time() - mtime) / 3600
+    if age_hours <= INPUT_SHEET_MAX_AGE_HOURS:
+        return
+
+    modified = datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M")
+    msg = (f"Input sheet is {age_hours:.1f}h old "
+           f"(modified {modified}, limit {INPUT_SHEET_MAX_AGE_HOURS}h).")
+
+    if auto_mode:
+        raise RuntimeError("No recent input sheet")
+
+    print(f"\n  ⚠  WARNING: {msg}")
+    answer = input("     Continue anyway? [Y/N] ").strip().lower()
+    if answer != "y" and answer != "yes":
+        print("Aborted.")
+        sys.exit(0)
+
+
+def load_portfolio(
+    xlsx_path: str | None = None,
+    *,
+    auto_mode: bool = False,
+) -> pd.DataFrame:
     """Load, filter, and annotate the portfolio table.
 
     Parameters
@@ -196,6 +225,8 @@ def load_portfolio(xlsx_path: str | None = None) -> pd.DataFrame:
     xlsx_path : str | None
         Explicit path to the Excel file.  If *None*, the most recent
         .xlsx in the configured assets directory is used.
+    auto_mode : bool
+        When *True*, a stale input sheet raises instead of prompting.
 
     Returns
     -------
@@ -204,6 +235,7 @@ def load_portfolio(xlsx_path: str | None = None) -> pd.DataFrame:
         ``is_option`` and ``clean_ticker``.
     """
     path = xlsx_path or _latest_xlsx(INPUT_DIR)
+    _check_sheet_freshness(path, auto_mode=auto_mode)
     print(f"Reading portfolio from {path} ...")
 
     df = pd.read_excel(path, engine="openpyxl")

@@ -32,6 +32,11 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 INPUT_DIR = os.path.join(PROJECT_ROOT, "assets")
 OUTPUT_DIR = os.path.join(PROJECT_ROOT, "output")
 
+# Maximum age (in hours) for the input .xlsx in assets/.
+# If the most recent file is older than this, interactive mode pauses
+# for confirmation and -auto mode aborts.
+INPUT_SHEET_MAX_AGE_HOURS = 11
+
 # --- Trading thresholds ---
 MINIMUM_TRADING_AMOUNT = 100      # USD – net orders below this value are skipped
 MAXIMUM_AMOUNT_AUTOMATIC_ORDER = 1500  # USD – auto-confirmed orders above this require explicit approval
@@ -106,7 +111,8 @@ IGNORE_NAMES: list[str] = [
     "TOHO TITANIUM CO LTD",
     "SUMITOMO BAKELITE CO LTD",
     "APERAM - DIVIDEND RIGHTS",
-    "TIC SOLUTIONS INC (OPTION)"
+    "TIC SOLUTIONS INC (OPTION)",
+    "INVESCO QQQ TRUST SERIES 1 (OPTION)"
 ]
 
 # --- Project Portfolio CSV column order ---
