@@ -15,6 +15,15 @@ from ib_async import IB
 
 from src.config import TWS_HOST, TWS_PORT, GATEWAY_PORT
 
+_CONNECT_HINT = (
+    "TWS/IB Gateway must be running with the API socket enabled. "
+    "In TWS: Edit → Global Configuration → API → Settings — enable "
+    '"Enable ActiveX and Socket Clients", set "Socket port" to match '
+    f"this app ({TWS_PORT} for TWS in the current TRADING_MODE, or set "
+    "IBKR_TWS_PORT). Recent TWS upgrades can clear these API flags. "
+    "With -auto, IB Gateway uses IBKR_GATEWAY_PORT (paper default 4002)."
+)
+
 # ==================================================================
 # Error-code suppression
 # ==================================================================
@@ -107,7 +116,12 @@ def connect(*, auto_start_gateway: bool = False) -> IB:
     # long-lived GTC orders from prior sessions, etc.).  With any
     # other clientId those orders are invisible to reqOpenOrders().
     ib = IB()
-    ib.connect(TWS_HOST, port, clientId=0)
+    try:
+        ib.connect(TWS_HOST, port, clientId=0)
+    except ConnectionRefusedError as exc:
+        raise RuntimeError(
+            f"API connection refused at {TWS_HOST!s}:{port}. {_CONNECT_HINT}"
+        ) from exc
 
     _IB_LOGGER.addFilter(_error_filter)
 

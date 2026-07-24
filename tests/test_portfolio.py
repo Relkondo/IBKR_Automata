@@ -129,6 +129,24 @@ class TestCleanTicker:
         })
         assert _clean_ticker(row) == "NVDA"
 
+    def test_strips_dot_country_suffix(self):
+        row = pd.Series({
+            "Security Ticker": "META.US", "Ticker": ""
+        })
+        assert _clean_ticker(row) == "META"
+
+    def test_strips_dot_country_suffix_numeric_ticker(self):
+        row = pd.Series({
+            "Security Ticker": "8299.TT", "Ticker": ""
+        })
+        assert _clean_ticker(row) == "8299"
+
+    def test_strips_dot_country_suffix_falls_back_to_ticker(self):
+        row = pd.Series({
+            "Security Ticker": None, "Ticker": "440110.KS"
+        })
+        assert _clean_ticker(row) == "440110"
+
 
 # ── _ticker_prefix ─────────────────────────────────────────────────
 
@@ -158,6 +176,14 @@ class TestTickerPrefix:
         })
         assert _ticker_prefix(row) == ""
 
+    def test_stock_uses_dot_country_suffix(self):
+        row = pd.Series({
+            "is_option": False,
+            "Security Ticker": "meta.us",
+            "Ticker": "",
+        })
+        assert _ticker_prefix(row) == "META"
+
 
 # ── _parse_ignore_sets and is_name_ignored ─────────────────────────
 
@@ -178,8 +204,10 @@ class TestIgnoreNames:
         assert is_name_ignored("ENPLAS CORP", is_option=True) is True
 
     def test_is_name_ignored_option_only(self):
-        assert is_name_ignored("TIC SOLUTIONS INC", is_option=True) is True
-        assert is_name_ignored("TIC SOLUTIONS INC", is_option=False) is False
+        assert is_name_ignored(
+            "STATE STREET SPDR EURO STOXX", is_option=True) is True
+        assert is_name_ignored(
+            "STATE STREET SPDR EURO STOXX", is_option=False) is False
 
     def test_is_name_ignored_case_insensitive(self):
         assert is_name_ignored("enplas corp", is_option=False) is True

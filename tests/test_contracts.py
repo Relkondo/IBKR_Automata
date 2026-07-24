@@ -303,6 +303,69 @@ class TestResolveOption:
         assert result is not None
         assert result[0] == 300
 
+    def test_month_only_ticker_matches_held_position(self, mock_ib):
+        """New dot-suffix tickers (e.g. 'TLT 7 P82.5.US') have no day —
+        resolve by matching an already-held option position instead."""
+        held_c = MockContract(
+            conId=891279337, symbol="TLT", currency="USD",
+            lastTradeDateOrContractMonth="20260731", right="P", strike=82.5,
+        )
+        held_position = MockPosition(contract=held_c, position=-2)
+        cd = MockContractDetails(
+            contract=held_c, longName="ISHARES 20+ YEAR TREASURY BD",
+            marketRuleIds="32109",
+        )
+        mock_ib.reqContractDetails.return_value = [cd]
+
+        result = _resolve_option(
+            mock_ib, "TLT 7 P82.5.US", None, "July 26 Puts on TLT US",
+            [held_position],
+        )
+        assert result is not None
+        assert result[0] == 891279337
+        mock_ib.reqContractDetails.assert_called_once()
+
+    def test_month_only_ticker_no_matching_position(self, mock_ib):
+        """A month-only ticker for a position that isn't currently held
+        can't be resolved (the day is unknowable) — fails loudly."""
+        result = _resolve_option(
+            mock_ib, "SPXW 8 P7200.US", None, "August 26 Puts on SPX", [],
+        )
+        assert result is None
+        mock_ib.reqContractDetails.assert_not_called()
+
+    def test_month_only_ticker_wrong_month_no_match(self, mock_ib):
+        """A held position with the same underlying/right/strike but a
+        different expiry month should not match."""
+        held_c = MockContract(
+            conId=1, symbol="TLT", lastTradeDateOrContractMonth="20260228",
+            right="P", strike=82.5,
+        )
+        held_position = MockPosition(contract=held_c, position=-2)
+
+        result = _resolve_option(
+            mock_ib, "TLT 7 P82.5.US", None, None, [held_position],
+        )
+        assert result is None
+
+    def test_month_only_ticker_ambiguous_multiple_matches(self, mock_ib):
+        """Two held positions with the same underlying/right/strike in
+        the same expiry month can't be disambiguated — fails loudly."""
+        c1 = MockContract(
+            conId=1, symbol="TLT", lastTradeDateOrContractMonth="20260724",
+            right="P", strike=82.5,
+        )
+        c2 = MockContract(
+            conId=2, symbol="TLT", lastTradeDateOrContractMonth="20260731",
+            right="P", strike=82.5,
+        )
+        positions = [MockPosition(contract=c1), MockPosition(contract=c2)]
+
+        result = _resolve_option(
+            mock_ib, "TLT 7 P82.5.US", None, None, positions,
+        )
+        assert result is None
+
 
 # ── resolve_conids ─────────────────────────────────────────────────
 

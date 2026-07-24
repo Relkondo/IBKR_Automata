@@ -22,6 +22,8 @@ class MockContract:
     primaryExchange: str = ""
     lastTradeDateOrContractMonth: str = ""
     description: str = ""
+    right: str = ""
+    strike: float = 0.0
 
 
 @dataclass

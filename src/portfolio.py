@@ -95,38 +95,51 @@ def _is_option(row: pd.Series) -> bool:
     return False
 
 
+def _strip_ticker_suffix(raw: str) -> str:
+    """Strip a trailing country/exchange tag from a Bloomberg-style ticker.
+
+    Handles both the space-separated form (``'NVDA US Equity'`` →
+    ``'NVDA'``) and the dot-separated form (``'META.US'`` → ``'META'``).
+    """
+    raw = raw.strip()
+    stripped = re.sub(
+        r"\s+[A-Z]{1,3}\s+(?:Equity|Index)$", "", raw, flags=re.IGNORECASE,
+    )
+    if stripped != raw:
+        return stripped.strip()
+    return re.sub(r"\.[A-Za-z]{1,3}$", "", raw).strip()
+
+
 def _clean_ticker(row: pd.Series) -> str:
     """Pick the best ticker for a row and strip Bloomberg-style suffixes.
 
     Prefers ``Security Ticker`` when present, falls back to ``Ticker``.
     Strips trailing country + asset-class tags
-    (e.g. ``'NVDA US Equity'`` → ``'NVDA'``).
+    (e.g. ``'NVDA US Equity'`` → ``'NVDA'``, ``'META.US'`` → ``'META'``).
     """
     sec = row.get("Security Ticker")
     raw = str(sec).strip() if pd.notna(sec) and str(sec).strip() else \
         str(row.get("Ticker", "")).strip()
-    return re.sub(
-        r"\s+[A-Z]{2}\s+(?:Equity|Index)$", "", raw,
-        flags=re.IGNORECASE,
-    ).strip()
+    return _strip_ticker_suffix(raw)
 
 
 def _ticker_prefix(row: pd.Series) -> str:
     """Return the ticker prefix used for redirection matching.
 
-    Options use the Ticker column; stocks use Security Ticker
-    (falling back to Ticker).  Only the part before the first space
-    is returned, upper-cased.
+    Options use the Ticker column (first whitespace-separated token,
+    e.g. ``'QQQ'`` from ``'QQQ US 02/27/26 P600 Equity'``); stocks use
+    Security Ticker (falling back to Ticker) with the country/exchange
+    suffix stripped, upper-cased.
     """
     if row.get("is_option"):
         raw = str(row.get("Ticker", "")).strip()
-    else:
-        sec = row.get("Security Ticker")
-        raw = (str(sec).strip()
-               if pd.notna(sec) and str(sec).strip()
-               else str(row.get("Ticker", "")).strip())
-    parts = raw.split()
-    return parts[0].upper() if parts else ""
+        parts = raw.split()
+        return parts[0].upper() if parts else ""
+    sec = row.get("Security Ticker")
+    raw = (str(sec).strip()
+           if pd.notna(sec) and str(sec).strip()
+           else str(row.get("Ticker", "")).strip())
+    return _strip_ticker_suffix(raw).upper()
 
 
 def _apply_ticker_redirects(df: pd.DataFrame) -> pd.DataFrame:

@@ -12,10 +12,22 @@ import re
 import time
 
 import pandas as pd
-from ib_async import IB, Stock, Option
+from ib_async import IB, Stock, Option, Contract
 
 from src.connection import suppress_errors
 from src.portfolio import OPT_TICKER_RE
+
+
+# Matches the newer dot-suffix option tickers, e.g. ``"TLT 7 P82.5.US"``
+# or ``"SPXW 8 P7200.US"``.  Unlike ``OPT_TICKER_RE`` this format only
+# gives the expiry *month* — the day is not present in the feed, so
+# these can only be resolved against an already-held IBKR position.
+NEW_OPT_TICKER_RE = re.compile(
+    r"^(?P<underlying>[A-Za-z]+)"
+    r"\s+(?P<month>\d{1,2})"
+    r"\s+(?P<right>[CP])(?P<strike>[\d.]+)"
+    r"\.[A-Za-z]{1,3}$"
+)
 
 
 # ==================================================================
@@ -330,20 +342,85 @@ def _resolve_redirected(
 # Option resolution
 # ==================================================================
 
+def _resolve_option_by_position(
+    ib: IB, m: re.Match, mic: str | None, opt_positions: list,
+) -> tuple[int, str | None, str | None, str | None, str, str] | None:
+    """Resolve a month-only option ticker (``NEW_OPT_TICKER_RE``) by
+    matching it against already-held IBKR option positions.
+
+    The day of expiry isn't present in this ticker format, so a fresh
+    contract can't be constructed — this only succeeds when the exact
+    underlying/right/strike is already an open position, narrowing by
+    expiry month if more than one position matches.
+    """
+    underlying = m.group("underlying").upper()
+    right = m.group("right")
+    strike = float(m.group("strike"))
+    month = int(m.group("month"))
+    label = f"{underlying} {right}{strike}"
+
+    matches = [
+        pos for pos in opt_positions
+        if pos.contract.symbol.upper() == underlying
+        and pos.contract.right == right
+        and abs(pos.contract.strike - strike) < 1e-6
+    ]
+
+    if len(matches) > 1:
+        narrowed = [
+            pos for pos in matches
+            if len(pos.contract.lastTradeDateOrContractMonth) >= 6
+            and int(pos.contract.lastTradeDateOrContractMonth[4:6]) == month
+        ]
+        if narrowed:
+            matches = narrowed
+
+    if not matches:
+        print(f"    [!] No held IBKR position matches option '{label}' "
+              f"(month {month}) — month-only tickers can only resolve "
+              f"against existing positions, not new option trades")
+        return None
+    if len(matches) > 1:
+        print(f"    [!] Ambiguous: {len(matches)} held positions match "
+              f"'{label}' for month {month}")
+        return None
+
+    conid = matches[0].contract.conId
+    details = ib.reqContractDetails(Contract(conId=conid))
+    if not details:
+        print(f"    [!] Could not fetch contract details for conid {conid}")
+        return None
+
+    cd = details[0]
+    c = cd.contract
+    desc = (
+        cd.longName
+        or f"{c.symbol} {c.lastTradeDateOrContractMonth} {right}{strike}"
+    )
+    return c.conId, desc, c.symbol, mic, (c.currency or "USD"), _dedup_rule_ids(cd.marketRuleIds)
+
+
 def _resolve_option(
     ib: IB, ticker: str, mic: str | None, name: str | None,
+    opt_positions: list | None = None,
 ) -> tuple[int, str | None, str | None, str | None, str, str] | None:
     """Resolve an option to ``(conid, description, symbol, mic,
     currency, market_rule_ids)``.
 
     Parses tickers like ``"QQQ US 02/27/26 P600 Equity"``, qualifies
     the underlying stock, then looks up the exact option contract.
+    Month-only tickers (e.g. ``"TLT 7 P82.5.US"``) are resolved
+    against already-held IBKR positions instead — see
+    ``_resolve_option_by_position``.
     """
     clean = re.sub(
         r"\s+(?:Equity|Index)$", "", ticker.strip(), flags=re.IGNORECASE,
     )
     m = OPT_TICKER_RE.match(clean)
     if not m:
+        m2 = NEW_OPT_TICKER_RE.match(clean)
+        if m2:
+            return _resolve_option_by_position(ib, m2, mic, opt_positions or [])
         print(f"    [!] Cannot parse option ticker '{ticker}'")
         return None
 
@@ -407,12 +484,16 @@ def resolve_conids(ib: IB, df: pd.DataFrame) -> pd.DataFrame:
     user already holds the most shares.
     """
     # Pre-fetch IBKR positions so redirected-exchange resolution can
-    # prefer the exchange where the user already has the most exposure.
+    # prefer the exchange where the user already has the most exposure,
+    # and so month-only option tickers can be matched to an open position.
     positions: dict[int, float] = {}
+    opt_positions: list = []
     for pos in ib.positions():
         cid = pos.contract.conId
         if cid:
             positions[cid] = float(pos.position)
+        if pos.contract.secType == "OPT":
+            opt_positions.append(pos)
 
     conids: list[int | None] = []
     api_names: list[str | None] = []
@@ -434,7 +515,7 @@ def resolve_conids(ib: IB, df: pd.DataFrame) -> pd.DataFrame:
             raw = str(row.get("Ticker", "")).strip()
             print(f"  {label} Option  '{raw}' …")
             with suppress_errors(200):
-                result = _resolve_option(ib, raw, mic, name)
+                result = _resolve_option(ib, raw, mic, name, opt_positions)
         else:
             print(f"  {label} Stock   '{symbol}' …")
             with suppress_errors(200):
