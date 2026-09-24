@@ -209,6 +209,11 @@ class TestIgnoreNames:
         assert is_name_ignored(
             "STATE STREET SPDR EURO STOXX", is_option=False) is False
 
+    def test_is_name_ignored_sofr_future(self):
+        assert is_name_ignored(
+            "Secured Overnight Financing Rate 3-month Average of Rates",
+            is_option=False) is True
+
     def test_is_name_ignored_case_insensitive(self):
         assert is_name_ignored("enplas corp", is_option=False) is True
 

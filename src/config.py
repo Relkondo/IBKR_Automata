@@ -117,6 +117,7 @@ IGNORE_NAMES: list[str] = [
     "SS SPDR S&P INSURANCE ETF",
     "INVESCO QQQ TRUST SERIES 1 (OPTION)",
     "STATE STREET SPDR EURO STOXX (OPTION)",
+    "Secured Overnight Financing Rate 3-month Average of Rates",  # SOFR3 futures
 ]
 
 # --- Project Portfolio CSV column order ---
